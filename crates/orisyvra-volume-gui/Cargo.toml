@@ -1,0 +1,34 @@
+[package]
+name = "orisyvra-volume-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "OrIsyVra encrypted-volume desktop application"
+build = "build.rs"
+publish = false
+
+[package.metadata.winresource]
+ProductName = "OrIsyVra Encrypted Volumes"
+FileDescription = "OrIsyVra encrypted-volume desktop application"
+CompanyName = "OrIsyVra Project"
+OriginalFilename = "orisyvra-volume-gui.exe"
+LegalCopyright = "Copyright © 2026 OrIsyVra Contributors"
+
+[[bin]]
+name = "orisyvra-volume-gui"
+path = "src/main.rs"
+
+[dependencies]
+eframe.workspace = true
+orisyvra = { path = "../orisyvra" }
+orisyvra-volume = { path = "../orisyvra-volume" }
+orisyvra-windows = { path = "../orisyvra-windows" }
+rand.workspace = true
+rfd.workspace = true
+zeroize.workspace = true
+
+[build-dependencies]
+winresource = "0.1.31"

@@ -1,0 +1,30 @@
+[package]
+name = "orisyvra-analysis"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "OrIsyVra reduced-round cryptanalysis tool"
+build = "build.rs"
+publish = false
+
+[package.metadata.winresource]
+ProductName = "OrIsyVra"
+FileDescription = "OrIsyVra reduced-round cryptanalysis tool"
+CompanyName = "OrIsyVra Project"
+OriginalFilename = "orisyvra-analysis.exe"
+LegalCopyright = "Copyright © 2026 OrIsyVra Contributors"
+
+[[bin]]
+name = "orisyvra-analysis"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+orisyvra-core = { path = "../orisyvra-core", features = ["analysis"] }
+rand.workspace = true
+
+[build-dependencies]
+winresource = "0.1.31"

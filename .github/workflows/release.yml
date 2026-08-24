@@ -1,0 +1,334 @@
+name: Release v0.2.0-alpha.1
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["main"]
+
+permissions:
+  contents: write
+  actions: write
+  statuses: write
+
+jobs:
+  cleanup:
+    if: github.event_name == 'workflow_dispatch' || github.event.head_commit.message == 'OrIsyVra v0.2.0-alpha.1'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Remove previous workflow runs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          current="$GITHUB_RUN_ID"
+          for pass in 1 2 3 4 5 6; do
+            json=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs?per_page=100")
+            active=$(printf '%s' "$json" | jq -r --argjson current "$current" '.workflow_runs[] | select(.id != $current and .status != "completed") | .id')
+            for id in $active; do
+              gh api --method POST "repos/$GITHUB_REPOSITORY/actions/runs/$id/cancel" >/dev/null 2>&1 || true
+            done
+            completed=$(printf '%s' "$json" | jq -r --argjson current "$current" '.workflow_runs[] | select(.id != $current and .status == "completed") | .id')
+            for id in $completed; do
+              gh api --method DELETE "repos/$GITHUB_REPOSITORY/actions/runs/$id" >/dev/null 2>&1 || true
+            done
+            [ -z "$active" ] && [ -z "$completed" ] && break
+            sleep 2
+          done
+
+  windows:
+    if: github.event_name == 'workflow_dispatch' || github.event.head_commit.message == 'OrIsyVra v0.2.0-alpha.1'
+    needs: cleanup
+    runs-on: windows-latest
+    env:
+      WINDOWS_PFX_BASE64: ${{ secrets.WINDOWS_PFX_BASE64 }}
+      WINDOWS_PFX_PASSWORD: ${{ secrets.WINDOWS_PFX_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Mark Windows validation pending
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          "WINDOWS_STAGE=rust" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          gh api --method POST "repos/$env:GITHUB_REPOSITORY/statuses/$env:GITHUB_SHA" -f state=pending -f context=release/windows -f description="Windows release validation running" | Out-Null
+      - name: Select Rust stable
+        shell: pwsh
+        run: |
+          rustup update stable
+          rustup default stable
+      - name: Test and build
+        shell: pwsh
+        run: |
+          "WINDOWS_STAGE=build" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          cargo test --workspace --all-features
+          if ($LASTEXITCODE -ne 0) { throw "cargo test failed" }
+          cargo build --release --workspace
+          if ($LASTEXITCODE -ne 0) { throw "cargo build failed" }
+          foreach ($file in @(
+            "target/release/orisyvra.exe",
+            "target/release/orisyvra-gui.exe",
+            "target/release/orisyvra-analysis.exe",
+            "target/release/orisyvra-volume-gui.exe",
+            "target/release/orisyvra-volume-mount.exe"
+          )) {
+            if (-not (Test-Path $file)) { throw "Missing Windows binary: $file" }
+          }
+      - name: Optional Authenticode signing
+        shell: pwsh
+        run: |
+          "WINDOWS_STAGE=sign-executables" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          if (-not [string]::IsNullOrWhiteSpace($env:WINDOWS_PFX_BASE64)) {
+            [IO.File]::WriteAllBytes("certificate.pfx", [Convert]::FromBase64String($env:WINDOWS_PFX_BASE64))
+            $signtool = (Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Filter signtool.exe -Recurse | Sort-Object FullName -Descending | Select-Object -First 1).FullName
+            if (-not $signtool) { throw "signtool.exe was not found" }
+            foreach ($file in @(
+              "target/release/orisyvra.exe",
+              "target/release/orisyvra-gui.exe",
+              "target/release/orisyvra-analysis.exe",
+              "target/release/orisyvra-volume-gui.exe",
+              "target/release/orisyvra-volume-mount.exe"
+            )) {
+              & $signtool sign /fd SHA256 /f certificate.pfx /p $env:WINDOWS_PFX_PASSWORD /tr http://timestamp.digicert.com /td SHA256 $file
+              if ($LASTEXITCODE -ne 0) { throw "Authenticode signing failed: $file" }
+            }
+            Remove-Item certificate.pfx -Force
+          }
+      - name: Stage public Windows executables
+        shell: pwsh
+        run: |
+          "WINDOWS_STAGE=stage" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target/release/orisyvra.exe dist/orisyvra.exe
+          Copy-Item target/release/orisyvra-gui.exe dist/orisyvra-gui.exe
+          Copy-Item target/release/orisyvra-analysis.exe dist/orisyvra-analysis.exe
+      - name: Install Inno Setup
+        shell: pwsh
+        run: |
+          "WINDOWS_STAGE=inno-install" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          choco install innosetup --no-progress -y
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup installation failed" }
+      - name: Build installer
+        shell: pwsh
+        run: |
+          "WINDOWS_STAGE=installer" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          $icon = Get-ChildItem "target/release/build/orisyvra-gui-*/out/orisyvra.ico" | Select-Object -First 1
+          if (-not $icon) { throw "Generated application icon was not found" }
+          $env:ORISYVRA_SOURCE = $env:GITHUB_WORKSPACE
+          $env:ORISYVRA_OUTPUT = Join-Path $env:GITHUB_WORKSPACE "dist"
+          $env:ORISYVRA_ICON = $icon.FullName
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" packaging/windows/OrIsyVra.iss
+          if ($LASTEXITCODE -ne 0) { throw "Installer build failed" }
+          $setupFile = Get-Item "dist/OrIsyVra-Setup-x86_64.exe"
+          if ($setupFile.Length -lt 100000) { throw "Installer output is unexpectedly small" }
+      - name: Optional installer signing
+        shell: pwsh
+        run: |
+          "WINDOWS_STAGE=sign-installer" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          if (-not [string]::IsNullOrWhiteSpace($env:WINDOWS_PFX_BASE64)) {
+            [IO.File]::WriteAllBytes("certificate.pfx", [Convert]::FromBase64String($env:WINDOWS_PFX_BASE64))
+            $signtool = (Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Filter signtool.exe -Recurse | Sort-Object FullName -Descending | Select-Object -First 1).FullName
+            if (-not $signtool) { throw "signtool.exe was not found" }
+            & $signtool sign /fd SHA256 /f certificate.pfx /p $env:WINDOWS_PFX_PASSWORD /tr http://timestamp.digicert.com /td SHA256 dist/OrIsyVra-Setup-x86_64.exe
+            if ($LASTEXITCODE -ne 0) { throw "Installer signing failed" }
+            Remove-Item certificate.pfx -Force
+          }
+      - name: Microsoft Defender scan
+        shell: pwsh
+        run: |
+          "WINDOWS_STAGE=defender" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          $status = Get-MpComputerStatus -ErrorAction SilentlyContinue
+          $platform = Get-ChildItem "$env:ProgramData\Microsoft\Windows Defender\Platform" -Directory -ErrorAction SilentlyContinue | Sort-Object Name -Descending | Select-Object -First 1
+          $mp = if ($platform) { Join-Path $platform.FullName "MpCmdRun.exe" } else { $null }
+          if ($status -and $status.AntivirusEnabled -and $mp -and (Test-Path $mp)) {
+            Update-MpSignature -ErrorAction SilentlyContinue | Out-Null
+            $allPassed = $true
+            foreach ($file in @(
+              "dist/orisyvra.exe",
+              "dist/orisyvra-gui.exe",
+              "dist/orisyvra-analysis.exe",
+              "target/release/orisyvra-volume-gui.exe",
+              "target/release/orisyvra-volume-mount.exe",
+              "dist/OrIsyVra-Setup-x86_64.exe"
+            )) {
+              $resolved = (Resolve-Path $file).Path
+              $output = @(& $mp -Scan -ScanType 3 -File $resolved 2>&1)
+              $code = $LASTEXITCODE
+              $output | ForEach-Object { Write-Host $_ }
+              Start-Sleep -Seconds 1
+              $detections = @(Get-MpThreatDetection -ErrorAction SilentlyContinue | Where-Object { ($_.Resources -join "`n") -like "*$resolved*" })
+              if ($detections.Count -gt 0 -or -not (Test-Path $resolved)) {
+                $detections | Format-List ThreatID,ThreatStatusID,Resources,ActionSuccess
+                throw "Microsoft Defender detected or quarantined: $file"
+              }
+              if ($code -ne 0) {
+                Write-Warning "Defender could not conclusively scan $file (MpCmdRun exit $code)."
+                $allPassed = $false
+              }
+            }
+            if ($allPassed) { Write-Host "Microsoft Defender hosted-runner scan: passed" }
+            else { Write-Warning "Microsoft Defender hosted-runner scan: inconclusive" }
+          } else {
+            Write-Warning "Microsoft Defender scanning is unavailable on this hosted runner."
+          }
+      - name: Windows checksums
+        shell: pwsh
+        run: |
+          "WINDOWS_STAGE=checksums" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          $names = @("orisyvra.exe", "orisyvra-gui.exe", "orisyvra-analysis.exe", "OrIsyVra-Setup-x86_64.exe")
+          $lines = foreach ($name in $names) {
+            $hash = (Get-FileHash "dist/$name" -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$hash  $name"
+          }
+          $lines | Set-Content -Encoding ascii dist/SHA256SUMS-windows.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-windows
+          path: |
+            dist/orisyvra.exe
+            dist/orisyvra-gui.exe
+            dist/orisyvra-analysis.exe
+            dist/OrIsyVra-Setup-x86_64.exe
+            dist/SHA256SUMS-windows.txt
+          if-no-files-found: error
+      - name: Report Windows validation
+        if: always()
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          if ($env:JOB_STATUS -eq "success") {
+            $state = "success"
+            $description = "Windows release package validated"
+          } else {
+            $state = "failure"
+            $stage = if ([string]::IsNullOrWhiteSpace($env:WINDOWS_STAGE)) { "unknown" } else { $env:WINDOWS_STAGE }
+            $description = "Windows release failed at $stage"
+          }
+          gh api --method POST "repos/$env:GITHUB_REPOSITORY/statuses/$env:GITHUB_SHA" -f state=$state -f context=release/windows -f description=$description | Out-Null
+
+  linux:
+    if: github.event_name == 'workflow_dispatch' || github.event.head_commit.message == 'OrIsyVra v0.2.0-alpha.1'
+    needs: cleanup
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install GUI dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
+      - run: cargo test --workspace --all-features
+      - run: cargo build --release --workspace
+      - name: Bundle
+        run: |
+          mkdir -p dist/orisyvra-linux-x86_64
+          cp target/release/orisyvra target/release/orisyvra-gui target/release/orisyvra-analysis dist/orisyvra-linux-x86_64/
+          cp README.md LICENSE dist/orisyvra-linux-x86_64/
+          cd dist
+          tar -czf OrIsyVra-v0.2.0-alpha.1-linux-x86_64.tar.gz orisyvra-linux-x86_64
+          sha256sum OrIsyVra-v0.2.0-alpha.1-linux-x86_64.tar.gz > SHA256SUMS-linux.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-linux
+          path: |
+            dist/OrIsyVra-v0.2.0-alpha.1-linux-x86_64.tar.gz
+            dist/SHA256SUMS-linux.txt
+          if-no-files-found: error
+
+  macos:
+    if: github.event_name == 'workflow_dispatch' || github.event.head_commit.message == 'OrIsyVra v0.2.0-alpha.1'
+    needs: cleanup
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo test --workspace --all-features
+      - run: cargo build --release --workspace
+      - name: Bundle
+        run: |
+          mkdir -p dist/orisyvra-macos-arm64
+          cp target/release/orisyvra target/release/orisyvra-gui target/release/orisyvra-analysis dist/orisyvra-macos-arm64/
+          cp README.md LICENSE dist/orisyvra-macos-arm64/
+          cd dist
+          tar -czf OrIsyVra-v0.2.0-alpha.1-macos-arm64.tar.gz orisyvra-macos-arm64
+          shasum -a 256 OrIsyVra-v0.2.0-alpha.1-macos-arm64.tar.gz > SHA256SUMS-macos.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-macos
+          path: |
+            dist/OrIsyVra-v0.2.0-alpha.1-macos-arm64.tar.gz
+            dist/SHA256SUMS-macos.txt
+          if-no-files-found: error
+
+  publish:
+    if: github.event_name == 'workflow_dispatch' || github.event.head_commit.message == 'OrIsyVra v0.2.0-alpha.1'
+    needs: [windows, linux, macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Replace v0.2.0-alpha.1 release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          gh release delete v0.2.0-alpha.1 --repo "$GITHUB_REPOSITORY" --cleanup-tag -y || true
+          gh release create v0.2.0-alpha.1 \
+            dist/OrIsyVra-Setup-x86_64.exe \
+            dist/orisyvra.exe \
+            dist/orisyvra-gui.exe \
+            dist/orisyvra-analysis.exe \
+            dist/SHA256SUMS-windows.txt \
+            dist/OrIsyVra-v0.2.0-alpha.1-linux-x86_64.tar.gz \
+            dist/SHA256SUMS-linux.txt \
+            dist/OrIsyVra-v0.2.0-alpha.1-macos-arm64.tar.gz \
+            dist/SHA256SUMS-macos.txt \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "OrIsyVra v0.2.0-alpha.1" \
+            --notes "Research alpha with unified visual keys, session-only unlock, Guarded/Native file encryption, and the Windows encrypted-volume GUI with optional sign-in auto-mount. Guarded Mode remains the default."
+          expected=$(printf '%s\n' \
+            OrIsyVra-Setup-x86_64.exe \
+            OrIsyVra-v0.2.0-alpha.1-linux-x86_64.tar.gz \
+            OrIsyVra-v0.2.0-alpha.1-macos-arm64.tar.gz \
+            SHA256SUMS-linux.txt \
+            SHA256SUMS-macos.txt \
+            SHA256SUMS-windows.txt \
+            orisyvra-analysis.exe \
+            orisyvra-gui.exe \
+            orisyvra.exe | sort)
+          actual=$(gh release view v0.2.0-alpha.1 --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' | sort)
+          test "$actual" = "$expected"
+          gh api --method POST "repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" -f state=success -f context=release/publish -f description="Release asset whitelist verified" | jq -e '.state == "success"' >/dev/null
+
+  cleanup-history:
+    if: ${{ always() && (github.event_name == 'workflow_dispatch' || github.event.head_commit.message == 'OrIsyVra v0.2.0-alpha.1') }}
+    needs: [publish]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete staging branch after publication
+        if: needs.publish.result == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api --method DELETE "repos/$GITHUB_REPOSITORY/git/refs/heads/work/session-volume" >/dev/null 2>&1 || true
+      - name: Keep only this release run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          current="$GITHUB_RUN_ID"
+          for pass in 1 2 3 4 5 6 7 8 9 10; do
+            json=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs?per_page=100")
+            active=$(printf '%s' "$json" | jq -r --argjson current "$current" '.workflow_runs[] | select(.id != $current and .status != "completed") | .id')
+            for id in $active; do
+              gh api --method POST "repos/$GITHUB_REPOSITORY/actions/runs/$id/cancel" >/dev/null 2>&1 || true
+            done
+            completed=$(printf '%s' "$json" | jq -r --argjson current "$current" '.workflow_runs[] | select(.id != $current and .status == "completed") | .id')
+            for id in $completed; do
+              gh api --method DELETE "repos/$GITHUB_REPOSITORY/actions/runs/$id" >/dev/null 2>&1 || true
+            done
+            [ -z "$active" ] && [ -z "$completed" ] && break
+            sleep 2
+          done

@@ -1,0 +1,51 @@
+[package]
+name = "orisyvra"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "OrIsyVra authenticated file encryption CLI"
+readme = "../../README.md"
+build = "build.rs"
+publish = false
+
+[package.metadata.winresource]
+ProductName = "OrIsyVra"
+FileDescription = "OrIsyVra authenticated file encryption CLI"
+CompanyName = "OrIsyVra Project"
+OriginalFilename = "orisyvra.exe"
+LegalCopyright = "Copyright © 2026 OrIsyVra Contributors"
+
+[lib]
+name = "orisyvra"
+path = "src/lib.rs"
+
+[[bin]]
+name = "orisyvra"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+argon2.workspace = true
+base64.workspace = true
+chacha20poly1305.workspace = true
+clap.workspace = true
+font8x8.workspace = true
+hkdf.workspace = true
+hmac.workspace = true
+image.workspace = true
+orisyvra-core = { path = "../orisyvra-core" }
+qrcode.workspace = true
+rand.workspace = true
+rpassword.workspace = true
+rqrr.workspace = true
+sha2.workspace = true
+subtle.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+zeroize.workspace = true
+
+[build-dependencies]
+winresource = "0.1.31"

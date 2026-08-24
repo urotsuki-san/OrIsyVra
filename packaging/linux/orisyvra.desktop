@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=OrIsyVra
+Comment=Authenticated file encryption
+Exec=orisyvra-gui
+Terminal=false
+Categories=Utility;Security;
+StartupNotify=true

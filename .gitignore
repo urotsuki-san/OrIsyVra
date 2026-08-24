@@ -1,0 +1,22 @@
+# Rust build output
+/target/
+**/target/
+
+# Fuzzing output
+/fuzz/artifacts/
+/fuzz/corpus/
+
+# Python cache
+**/__pycache__/
+*.py[cod]
+
+# Local secrets and generated key material
+.env
+.env.*
+!.env.example
+*.orisyvra
+*.orisyvra-key
+
+# OS files
+.DS_Store
+Thumbs.db

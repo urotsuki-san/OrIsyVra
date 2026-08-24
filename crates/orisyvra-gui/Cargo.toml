@@ -1,0 +1,31 @@
+[package]
+name = "orisyvra-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "OrIsyVra desktop file encryption application"
+build = "build.rs"
+publish = false
+
+[package.metadata.winresource]
+ProductName = "OrIsyVra"
+FileDescription = "OrIsyVra desktop file encryption application"
+CompanyName = "OrIsyVra Project"
+OriginalFilename = "orisyvra-gui.exe"
+LegalCopyright = "Copyright © 2026 OrIsyVra Contributors"
+
+[[bin]]
+name = "orisyvra-gui"
+path = "src/main.rs"
+
+[dependencies]
+eframe.workspace = true
+orisyvra = { path = "../orisyvra" }
+rfd.workspace = true
+zeroize.workspace = true
+
+[build-dependencies]
+winresource = "0.1.31"

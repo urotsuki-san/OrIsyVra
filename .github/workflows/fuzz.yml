@@ -1,0 +1,21 @@
+name: Fuzz smoke tests
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install nightly
+      - run: cargo install cargo-fuzz
+      - name: Container parser
+        working-directory: fuzz
+        run: cargo +nightly fuzz run container -- -max_total_time=30 -max_len=1048576
+      - name: Key-card parser
+        working-directory: fuzz
+        run: cargo +nightly fuzz run keycard -- -max_total_time=30 -max_len=1048576
