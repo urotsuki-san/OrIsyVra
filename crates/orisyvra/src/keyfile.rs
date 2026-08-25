@@ -7,7 +7,7 @@ use chacha20poly1305::aead::{Aead, Payload};
 use chacha20poly1305::{KeyInit, XChaCha20Poly1305, XNonce};
 use rand::rngs::OsRng;
 use rand::RngCore;
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::error::{Error, Result};
 
@@ -162,8 +162,8 @@ pub(crate) fn encode_keyfile_bytes(
     OsRng.fill_bytes(&mut salt);
     OsRng.fill_bytes(&mut nonce);
     let header = encode_header(params, &salt, &nonce);
-    let mut wrapping_key = derive_wrapping_key(password, &salt, params)?;
-    let cipher = XChaCha20Poly1305::new_from_slice(&wrapping_key)
+    let wrapping_key = Zeroizing::new(derive_wrapping_key(password, &salt, params)?);
+    let cipher = XChaCha20Poly1305::new_from_slice(wrapping_key.as_ref())
         .map_err(|_| Error::Crypto("invalid wrapping key"))?;
     let wrapped = cipher
         .encrypt(
@@ -174,7 +174,6 @@ pub(crate) fn encode_keyfile_bytes(
             },
         )
         .map_err(|_| Error::Crypto("key capsule encryption failed"))?;
-    wrapping_key.zeroize();
     if wrapped.len() != WRAPPED_KEY_SIZE {
         return Err(Error::Crypto("unexpected key capsule size"));
     }
@@ -209,8 +208,8 @@ pub(crate) fn unlock_keyfile_bytes(bytes: &[u8], password: &[u8]) -> Result<Mast
         .try_into()
         .map_err(|_| Error::InvalidFormat("truncated key capsule header"))?;
     let (params, salt, nonce) = decode_header(&header)?;
-    let mut wrapping_key = derive_wrapping_key(password, &salt, params)?;
-    let cipher = XChaCha20Poly1305::new_from_slice(&wrapping_key)
+    let wrapping_key = Zeroizing::new(derive_wrapping_key(password, &salt, params)?);
+    let cipher = XChaCha20Poly1305::new_from_slice(wrapping_key.as_ref())
         .map_err(|_| Error::Crypto("invalid wrapping key"))?;
     let mut plaintext = cipher
         .decrypt(
@@ -221,7 +220,6 @@ pub(crate) fn unlock_keyfile_bytes(bytes: &[u8], password: &[u8]) -> Result<Mast
             },
         )
         .map_err(|_| Error::AuthenticationFailed)?;
-    wrapping_key.zeroize();
     if plaintext.len() != MASTER_KEY_SIZE {
         plaintext.zeroize();
         return Err(Error::InvalidFormat("unexpected master-key size"));

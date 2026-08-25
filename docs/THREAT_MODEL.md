@@ -2,47 +2,85 @@
 
 ## Protected assets
 
-- plaintext files;
-- the 384-bit master key;
-- visual-key material;
-- encrypted-record integrity and ordering.
+- plaintext files and mounted-volume plaintext;
+- the random 384-bit master key;
+- Visual Key material and Windows PIN-card bindings;
+- encrypted-record integrity and ordering;
+- authenticated volume metadata and logical block placement.
 
 ## Attacker capabilities
 
-The attacker may read, copy, modify, truncate, reorder, or replace encrypted files and visual keys. A stolen visual key may be subjected to offline passphrase guessing because it contains an Argon2id-protected key capsule.
+An attacker may read, copy, modify, truncate, reorder, or replace encrypted files, encrypted-volume backing files, and Visual Key PNGs.
 
-The attacker may also attempt to replace one visual key with another. Users can compare the displayed key fingerprint when identity matters.
+A stolen passphrase-protected Visual Key permits offline passphrase guessing against its Argon2id-protected key capsule.
+
+For a Windows PIN card, the attacker may possess the PNG and know or guess its four-digit PIN. The model assumes the attacker does not also have the DPAPI-unwrapped device secret unless the Windows account or active session is compromised.
+
+The displayed key fingerprint and Key Sigil are identifiers only. Replacing one Visual Key with another is within the attacker model.
 
 ## Assumptions
 
 - the operating-system CSPRNG is available;
-- the endpoint is not already compromised during encryption or decryption;
-- the visual key, its backups, and recovery material are stored appropriately;
-- the passphrase has adequate entropy;
-- external cryptographic dependencies behave as specified.
+- external cryptographic dependencies behave as specified;
+- Windows DPAPI protects the PIN-card device secret within the current-user trust boundary;
+- the endpoint is not already compromised while secrets are unlocked;
+- recovery material is stored separately and protected appropriately;
+- passphrase recovery keys use adequate passphrase entropy.
+
+## Windows PIN-card boundary
+
+A Windows PIN card requires:
+
+1. the protected key capsule inside the PNG;
+2. a random 256-bit device secret protected with Windows DPAPI;
+3. the four-digit PIN.
+
+The device secret supplies cryptographic entropy that the PIN alone cannot provide. Copying the PNG to another Windows account does not copy the DPAPI binding.
+
+The binding is software and account based. It is not equivalent to a hardware-backed non-exportable key. Malware or an attacker with sufficient access to the same Windows user context may be able to use the protected device secret or inspect an already-unlocked master key.
+
+Loss of the Windows profile or DPAPI binding can make a PIN card unusable. A separate recovery key is required when recovery from device loss matters.
+
+## Passphrase-protected keys
+
+Passphrase-protected Visual Keys wrap the random master key with an Argon2id-derived key and XChaCha20-Poly1305. Their offline-guessing resistance is bounded by passphrase entropy and KDF cost.
 
 ## Desktop session
 
-The desktop application unwraps the selected visual key once and retains the master key in process memory until Lock or application exit. The passphrase is cleared after the unlock operation. This does not protect against malware, process-memory inspection with sufficient privilege, or an already compromised user session.
+The desktop application unwraps the selected Visual Key once and keeps the master key in process memory until **Lock** or application exit. PIN and passphrase buffers are cleared after use where practical.
 
-The application remembers only the selected key path. It does not persist the passphrase or unwrapped master key.
+This does not protect against malware, privileged process-memory inspection, UI capture, or an already compromised user session.
+
+The application may remember the selected key path. Raw master keys and PINs are not persisted by the application.
 
 ## Modes
 
-**Guarded Mode** is the default and wraps each Native record in XChaCha20-Poly1305.
+**Guarded Mode** is the default and protects each Native record with an independent XChaCha20-Poly1305 layer.
 
-**Native Research Mode** exposes the experimental OrIsyVra construction for cryptanalysis and research data. It requires explicit acknowledgement in the GUI and CLI.
+**Native Research Mode** exposes the OrIsyVra Native construction directly for analysis. It requires explicit acknowledgement in the GUI and CLI.
 
-## Visual-key formats
+`P768/K384/C384/T256-R18` describes construction parameters, not a concrete security level. Native Research Mode currently has no claimed security strength.
 
-The digital PNG contains the protected key capsule in a private ancillary PNG chunk. The visible QR encodes the same protected capsule for print/camera recovery. Loss of the private PNG chunk does not disclose the master key, but it can remove the fast digital-key path and leave only optical recovery.
+## Visual Key format
+
+Current Visual Key PNG files store the protected key capsule in private ancillary chunk `orKY`. Windows PIN cards also contain the non-secret `orPn` policy marker. The displayed fingerprint and Key Sigil are non-secret identifiers.
+
+Older passphrase-protected key files remain supported.
+
+## Encrypted volumes
+
+The Windows volume layer authenticates logical blocks, block locations, generations, and alternating superblock state. The mounted disk also depends on WinSpd, the Windows storage stack, and the selected Windows filesystem.
+
+Windows integration registration does not change the trust assumptions of DPAPI, Task Scheduler, WinSpd, NTFS/exFAT, or the Windows kernel.
 
 ## Out of scope
 
-- malware controlling the host OS;
+- malware already controlling the host OS or user session;
+- kernel/root/administrator attackers while secrets are unlocked;
 - denial of service or file deletion;
 - hardware fault injection;
-- physical power or electromagnetic side channels;
-- recovery after loss of all visual keys and recovery material;
+- power and electromagnetic side channels;
+- recovery after loss of all device bindings and recovery keys;
 - hidden-volume deniability;
-- mountable encrypted-volume guarantees before P2 is implemented and tested.
+- concrete Native security claims before external cryptanalysis;
+- resistance to PIN guessing after disclosure of the DPAPI-unwrapped device secret.

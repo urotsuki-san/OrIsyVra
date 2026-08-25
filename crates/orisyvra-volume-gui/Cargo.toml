@@ -24,6 +24,7 @@ path = "src/main.rs"
 [dependencies]
 eframe.workspace = true
 orisyvra = { path = "../orisyvra" }
+orisyvra-pin = { path = "../orisyvra-pin" }
 orisyvra-volume = { path = "../orisyvra-volume" }
 orisyvra-windows = { path = "../orisyvra-windows" }
 rand.workspace = true

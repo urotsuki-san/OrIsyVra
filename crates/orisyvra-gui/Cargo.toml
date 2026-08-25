@@ -23,7 +23,9 @@ path = "src/main.rs"
 
 [dependencies]
 eframe.workspace = true
+image.workspace = true
 orisyvra = { path = "../orisyvra" }
+orisyvra-pin = { path = "../orisyvra-pin" }
 rfd.workspace = true
 zeroize.workspace = true
 

@@ -6,9 +6,11 @@
 //! append-only authenticated block log, two alternating authenticated superblocks, crash-safe
 //! commit ordering, and keyed random access by logical block number.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
+#[cfg(windows)]
+use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use chacha20poly1305::aead::{Aead, Payload};
@@ -257,6 +259,22 @@ struct RecordIndex {
     ciphertext_len: u32,
 }
 
+fn open_volume_file(path: &Path, create_new: bool) -> Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true);
+    if create_new {
+        options.create_new(true);
+    }
+    #[cfg(windows)]
+    {
+        // Windows carries this deny-share request through SMB. Samba/TrueNAS
+        // therefore rejects a second PC or scheduled task opening the same
+        // writable encrypted container at the same time.
+        options.share_mode(0);
+    }
+    Ok(options.open(path)?)
+}
+
 pub struct Volume {
     path: PathBuf,
     file: File,
@@ -271,11 +289,7 @@ impl Volume {
     pub fn create(path: &Path, master: &MasterKey, options: VolumeOptions) -> Result<Self> {
         let bootstrap = Bootstrap::new(options)?;
         let keys = derive_keys(master, &bootstrap)?;
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(path)?;
+        let mut file = open_volume_file(path, true)?;
         file.write_all(&bootstrap.encode())?;
         file.set_len(LOG_START)?;
 
@@ -307,7 +321,7 @@ impl Volume {
     }
 
     pub fn open(path: &Path, master: &MasterKey) -> Result<Self> {
-        let mut file = OpenOptions::new().read(true).write(true).open(path)?;
+        let mut file = open_volume_file(path, false)?;
         let mut bootstrap_bytes = [0_u8; BOOTSTRAP_SIZE];
         file.read_exact(&mut bootstrap_bytes)?;
         let bootstrap = Bootstrap::decode(&bootstrap_bytes)?;
@@ -406,70 +420,105 @@ impl Volume {
     }
 
     pub fn write_block(&mut self, block_index: u64, plaintext: &[u8]) -> Result<u64> {
-        self.validate_block_index(block_index)?;
-        if plaintext.len() > self.bootstrap.block_size as usize {
-            return Err(VolumeError::InvalidInput(format!(
-                "block payload exceeds {} bytes",
-                self.bootstrap.block_size
-            )));
+        self.write_blocks(&[(block_index, plaintext.to_vec())])?
+            .into_iter()
+            .next()
+            .ok_or_else(|| VolumeError::InvalidInput("empty block transaction".to_owned()))
+    }
+
+    /// Commits every internal block touched by one Windows I/O request with a
+    /// single authenticated superblock transition. This prevents a multi-block
+    /// filesystem write from becoming several reorderable SMB transactions.
+    pub fn write_blocks(&mut self, blocks: &[(u64, Vec<u8>)]) -> Result<Vec<u64>> {
+        if blocks.is_empty() {
+            return Ok(Vec::new());
         }
-        let generation = self
-            .index
-            .get(&block_index)
-            .map(|record| record.generation.saturating_add(1))
-            .unwrap_or(1);
-        if generation == 0 {
-            return Err(VolumeError::InvalidInput(
-                "block generation exhausted".to_owned(),
-            ));
+
+        let mut seen = HashSet::with_capacity(blocks.len());
+        for (block_index, plaintext) in blocks {
+            self.validate_block_index(*block_index)?;
+            if !seen.insert(*block_index) {
+                return Err(VolumeError::InvalidInput(
+                    "duplicate block in one transaction".to_owned(),
+                ));
+            }
+            if plaintext.len() > self.bootstrap.block_size as usize {
+                return Err(VolumeError::InvalidInput(format!(
+                    "block payload exceeds {} bytes",
+                    self.bootstrap.block_size
+                )));
+            }
         }
-        let plaintext_len = u32::try_from(plaintext.len())
-            .map_err(|_| VolumeError::InvalidInput("block payload is too large".to_owned()))?;
-        let ciphertext_len = plaintext_len
-            .checked_add(AEAD_TAG_SIZE as u32)
-            .ok_or_else(|| VolumeError::InvalidInput("block length overflow".to_owned()))?;
-        let header = RecordHeader {
-            block_index,
-            generation,
-            plaintext_len,
-            ciphertext_len,
-        };
-        let header_bytes = header.encode();
-        let nonce = record_nonce(&self.keys, &self.bootstrap, block_index, generation);
-        let aad = record_aad(&self.bootstrap, &header_bytes);
+
+        let mut next_offset = self.state.committed_end;
+        let mut records = Vec::with_capacity(blocks.len());
         let cipher = XChaCha20Poly1305::new_from_slice(&self.keys.key)
             .map_err(|_| VolumeError::AuthenticationFailed)?;
-        let ciphertext = cipher
-            .encrypt(
-                XNonce::from_slice(&nonce),
-                Payload {
-                    msg: plaintext,
-                    aad: &aad,
+
+        for (block_index, plaintext) in blocks {
+            let generation = match self.index.get(block_index) {
+                Some(previous) => previous.generation.checked_add(1).ok_or_else(|| {
+                    VolumeError::InvalidInput("block generation exhausted".to_owned())
+                })?,
+                None => 1,
+            };
+            let plaintext_len = u32::try_from(plaintext.len())
+                .map_err(|_| VolumeError::InvalidInput("block payload is too large".to_owned()))?;
+            let ciphertext_len = plaintext_len
+                .checked_add(AEAD_TAG_SIZE as u32)
+                .ok_or_else(|| VolumeError::InvalidInput("block length overflow".to_owned()))?;
+            let header = RecordHeader {
+                block_index: *block_index,
+                generation,
+                plaintext_len,
+                ciphertext_len,
+            };
+            let header_bytes = header.encode();
+            let nonce = record_nonce(&self.keys, &self.bootstrap, *block_index, generation);
+            let aad = record_aad(&self.bootstrap, &header_bytes);
+            let ciphertext = cipher
+                .encrypt(
+                    XNonce::from_slice(&nonce),
+                    Payload {
+                        msg: plaintext,
+                        aad: &aad,
+                    },
+                )
+                .map_err(|_| VolumeError::AuthenticationFailed)?;
+
+            self.file.seek(SeekFrom::Start(next_offset))?;
+            self.file.write_all(&header_bytes)?;
+            self.file.write_all(&ciphertext)?;
+            records.push((
+                *block_index,
+                RecordIndex {
+                    offset: next_offset,
+                    generation,
+                    plaintext_len,
+                    ciphertext_len,
                 },
-            )
-            .map_err(|_| VolumeError::AuthenticationFailed)?;
+            ));
+            next_offset = next_offset
+                .checked_add(RECORD_HEADER_SIZE as u64)
+                .and_then(|value| value.checked_add(ciphertext.len() as u64))
+                .ok_or_else(|| VolumeError::InvalidInput("volume offset overflow".to_owned()))?;
+        }
 
-        let offset = self.state.committed_end;
-        self.file.seek(SeekFrom::Start(offset))?;
-        self.file.write_all(&header_bytes)?;
-        self.file.write_all(&ciphertext)?;
         self.file.sync_data()?;
-
-        let committed_end = offset
-            .checked_add(RECORD_HEADER_SIZE as u64)
-            .and_then(|value| value.checked_add(ciphertext.len() as u64))
-            .ok_or_else(|| VolumeError::InvalidInput("volume offset overflow".to_owned()))?;
+        let added_records = u64::try_from(records.len())
+            .map_err(|_| VolumeError::InvalidInput("too many block updates".to_owned()))?;
         let next_state = SuperState {
-            generation: self.state.generation.saturating_add(1),
-            committed_end,
-            record_count: self.state.record_count.saturating_add(1),
+            generation: self.state.generation.checked_add(1).ok_or_else(|| {
+                VolumeError::InvalidInput("superblock generation exhausted".to_owned())
+            })?,
+            committed_end: next_offset,
+            record_count: self
+                .state
+                .record_count
+                .checked_add(added_records)
+                .ok_or_else(|| VolumeError::InvalidInput("record count exhausted".to_owned()))?,
             clean: false,
         };
-        if next_state.generation == 0 {
-            return Err(VolumeError::InvalidInput(
-                "superblock generation exhausted".to_owned(),
-            ));
-        }
         let next_slot = 1 - self.active_super;
         write_superblock(
             &mut self.file,
@@ -478,20 +527,18 @@ impl Volume {
             next_slot,
             next_state,
         )?;
-        self.file.sync_all()?;
 
-        self.index.insert(
-            block_index,
-            RecordIndex {
-                offset,
-                generation,
-                plaintext_len,
-                ciphertext_len,
-            },
-        );
+        let generations = records
+            .iter()
+            .map(|(_, record)| record.generation)
+            .collect::<Vec<_>>();
+        for (block_index, record) in records {
+            self.index.insert(block_index, record);
+        }
         self.state = next_state;
         self.active_super = next_slot;
-        Ok(generation)
+        self.file.sync_all()?;
+        Ok(generations)
     }
 
     pub fn mark_clean(&mut self) -> Result<()> {

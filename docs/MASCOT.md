@@ -2,29 +2,29 @@
 
 Status: **adopted**
 
-The current OrIsyVra README hero is:
+Current README artwork:
 
 ```text
 docs/assets/readme/orisyvra-showcase-hero-v1.png
 ```
 
-It is intentionally simple and follows the same visual language as the Hestia project banner: a dark flat background, sparse product copy on the left, a single pixel-art character on the right, and a restrained circular backdrop.
+## Character reference
 
-## Character identity
+The OrIsyVra character is separate from the Hestia project character.
 
-The OrIsyVra character is a sister-project character to Hestia, not Hestia recolored.
+Keep these features in future variations:
 
-Current distinguishing traits:
+- long dark-purple side ponytail;
+- purple eyes;
+- violet project palette;
+- padlock hair ornament;
+- dark coat with violet geometric trim;
+- pleated skirt and dark boots;
+- pose holding the Visual Key card.
 
-- long dark-purple side ponytail rather than Hestia's bob;
-- purple eyes and violet project palette;
-- **padlock hair ornament**;
-- long dark coat with violet geometric trim;
-- pleated skirt and dark boots that preserve a loose family resemblance;
-- a different pose, holding the visual-key card close to her chest;
-- calm, protective expression suited to an encryption project.
+Do not reuse Hestia's exact pose, hair, orange flame ornament, or character asset.
 
-The hero banner uses the approved wording:
+## Hero text
 
 ```text
 ORISYVRA
@@ -34,16 +34,13 @@ FOR FILES & VOLUMES
 ONE VISUAL KEY  •  AUTHENTICATED DATA  •  MOUNTABLE VOLUMES
 ```
 
-## Design constraints for future variations
+## Layout constraints
 
-Future character variations should preserve the adopted identity instead of drifting back toward Hestia or generic cyber-anime art:
+- use a simple dark background;
+- keep the character on the right and product copy on the left;
+- keep violet as the primary accent;
+- retain clear pixel-art edges;
+- avoid busy HUD panels, circuit motifs, code-rain effects, and stock security imagery;
+- keep the composition readable at README width.
 
-- keep the padlock hair ornament;
-- keep the long side-ponytail silhouette;
-- keep violet as the dominant project accent;
-- retain deliberate pixel-art edges;
-- avoid neon circuitry, code-rain, busy HUD panels, stock padlock imagery, or high-detail AI-anime rendering;
-- keep README hero compositions sparse and functional;
-- do not reuse Hestia's exact pose, hair, orange flame ornament, or character asset.
-
-The README image itself is the authoritative visual reference for this character.
+The checked-in README image is the visual reference for the character and layout.

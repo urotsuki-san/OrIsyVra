@@ -1,160 +1,159 @@
 # Windows Automatic Volume Mounting
 
-Status: **implemented as a Windows alpha feature; broad real-machine hardening remains**
+Status: **Windows alpha**
 
-OrIsyVra can restore registered encrypted volumes after a Windows user signs in. The current implementation is per-user and runs after sign-in; pre-login/system-volume mounting is outside this alpha.
+Automatic volume mounting is per-user and starts after Windows sign-in. Pre-login and system-volume mounting are not implemented.
 
-## User-facing behavior
+## Connection policies
 
-Each registered encrypted volume can enable:
+Each registered volume can use one of two sign-in policies.
 
-> **Mount automatically when I sign in to Windows**
-
-OrIsyVra stores non-secret registration metadata including:
-
-- `.orisyvra-volume` path;
-- visual-key path;
-- preferred drive letter;
-- read/write or read-only preference;
-- auto-mount flag;
-- selected unlock policy;
-- Windows mount-task registration state.
-
-The visual-key passphrase and raw 384-bit master key are not persisted.
-
-## Implemented unlock policies
-
-### 1. Prompt once at sign-in — recommended
-
-When auto-mount is enabled without full automatic unlock:
+### Prompt on sign-in
 
 1. Windows starts `orisyvra-volume-gui.exe --startup-automount` through the current user's Run entry.
-2. The GUI loads registered auto-mount entries and groups them by visual-key path.
-3. The user unlocks each required visual key once.
-4. The master key remains only in the GUI process memory.
-5. OrIsyVra creates a short-lived dedicated mount credential for each target volume and starts its already-registered elevated Windows mount task.
-6. The WinSpd host attaches the volume and attempts to restore its preferred drive letter.
-7. Temporary manual/startup credentials are one-shot and rejected after five minutes.
+2. The GUI groups registered volumes by Visual Key path.
+3. The user unlocks each required Visual Key once.
+4. OrIsyVra creates short-lived mount credentials for the matching volumes.
+5. The registered elevated mount tasks are started.
 
-A single visual-key passphrase therefore starts every configured prompt-once volume that uses that key; the user is not prompted once per volume.
+Windows PIN cards require the PNG, PIN, and the DPAPI-protected device binding described in [`PIN_CARDS.md`](PIN_CARDS.md).
 
-### 2. Windows auto-unlock — optional convenience mode
+Temporary credentials are one-shot and expire after five minutes.
 
-Full automatic mode is explicit opt-in and requires auto-mount to remain enabled.
+### Fully automatic
+
+Fully automatic mounting stores a dedicated random mount password protected with current-user Windows DPAPI.
 
 When enabled, OrIsyVra:
 
-1. starts from an already-unlocked visual-key master key;
-2. generates a random dedicated mount password;
-3. exports a separate protected mount credential carrying the same master key;
-4. protects only that random mount password with current-user Windows DPAPI;
-5. stores the DPAPI blob separately from the non-secret registration file.
+1. creates a separate mount credential containing the same master key;
+2. generates a random password for that credential;
+3. protects the password with Windows DPAPI;
+4. stores the DPAPI blob separately from registration metadata.
 
-The original visual-key passphrase is never stored. The raw OrIsyVra master key is not written as plaintext. Removing the DPAPI blob or dedicated credential does not rewrite or damage the encrypted volume; the visual-key PNG remains the durable recovery credential.
+The original Visual Key PIN or passphrase is not stored. The raw master key is not stored as plaintext.
 
-Security trade-off: malware running with sufficient access as the same logged-in Windows user may be able to invoke DPAPI or read data after the volume is mounted. Full automatic mode therefore provides less protection than prompt-once mode.
+Disabling automatic connection also disables automatic unlock and removes persistent mount material for that entry.
 
-If `auto_mount` is disabled, `auto_unlock` is also disabled and persistent mount material is removed. Temporary non-auto-unlock secrets are accepted for at most five minutes; expired material is rejected and removed together with its temporary credential capsule.
-
-## Startup and mount lifecycle
+## Startup flow
 
 ```text
 Windows user signs in
         │
-        ├─ fully automatic entries → elevated registered mount task
-        │                            reads DPAPI-protected mount credential
+        ├─ fully automatic entry
+        │      │
+        │      └─ DPAPI-protected mount credential
+        │                    │
+        │                    ▼
+        │             registered mount task
         │
-        └─ prompt-once entries → OrIsyVra Encrypted Volumes startup GUI
-                                  │
-                                  ├─ unlock visual key once
-                                  └─ start registered mount tasks
-                                                │
-                                                ▼
-                                     open .orisyvra-volume
-                                                │
-                                                ▼
-                                     WinSpd virtual SCSI disk
-                                                │
-                                                ▼
-                                     Windows NTFS / exFAT
-                                                │
-                                                ▼
-                                         preferred O:\
+        └─ prompt entry
+               │
+               └─ Encrypted Drives GUI
+                      │
+                      └─ unlock Visual Key
+                              │
+                              ▼
+                       registered mount task
+                              │
+                              ▼
+                       WinSpd virtual disk
+                              │
+                              ▼
+                       Windows filesystem
 ```
 
-The mount host marks the encrypted container dirty before exposing it. On normal **Unmount** it receives a stop request, flushes storage, marks the authenticated volume clean, detaches the WinSpd disk and removes its mounted-state marker.
-
-If the process is terminated before clean detach, the volume core uses authenticated A/B superblocks and committed-log recovery on the next open.
+The mount host authenticates the backing volume before exposing it through WinSpd.
 
 ## Configuration storage
 
-Current per-user root:
+Per-user mount state is stored under:
 
 ```text
 %APPDATA%\OrIsyVra\automount\
 ```
 
-It contains separate areas for:
+Current subdirectories:
 
 ```text
-entries\       non-secret registration metadata
+entries\       registration metadata
 credentials\   dedicated mount key capsules
-secrets\       DPAPI-protected random mount passwords
-state\         mounted/stop coordination files
+secrets\       DPAPI-protected mount passwords
+state\         mount and stop coordination files
 ```
 
-Registration files contain paths, preferences and policy flags. Sensitive unlock material is never embedded into the registration text.
+Windows PIN-card bindings are stored separately under:
 
-## Windows startup/task registration
+```text
+%APPDATA%\OrIsyVra\pin-cards\
+```
 
-Two Windows mechanisms are used for different purposes:
+PIN-card binding files contain DPAPI-protected random device secrets. They do not contain the PIN or plaintext master key.
 
-- **HKCU Run entry** — starts the Encrypted Volumes GUI in `--startup-automount` mode when prompt-once volumes exist.
-- **Task Scheduler** — each registered volume receives an elevated on-logon mount task for the WinSpd host. The GUI can also trigger that task manually after preparing a short-lived credential.
+## Windows registration
 
-Registering/removing an elevated mount task requires Windows approval through UAC. Normal file/folder encryption does not require WinSpd or these tasks.
+Two Windows mechanisms are used:
 
-The installer itself does not silently enable an encrypted volume for auto-mount; the option is configured per volume in the GUI.
+- **HKCU Run** starts the Encrypted Drives GUI when prompt-based sign-in entries exist;
+- **Task Scheduler** provides an elevated mount-host task for each registered volume.
 
-## Drive-letter policy
+The WinSpd mount host requires elevation. Task registration can therefore request UAC approval.
 
-A registered preferred letter is remembered. After a new WinSpd volume appears, the host compares Windows volume GUIDs before/after attachment and attempts to assign the preferred letter using Windows `mountvol`.
+Normal file and folder encryption does not use these mechanisms.
 
-If the preferred letter is already occupied, OrIsyVra does not steal it. Windows' existing assignment is kept and a diagnostic is emitted. Broad conflict UX is still being hardened.
+## Mounted-state tracking
 
-## Failure behavior
+A mounted-state file records the mount-host PID and volume path. The GUI checks the PID before treating an entry as mounted and removes stale state files when the process is no longer present.
 
-The intended fail-safe behavior is:
+A separate stop marker requests clean disconnection.
 
-- **visual key missing/wrong** → authentication fails; no volume reformat/rewrite;
-- **temporary credential older than five minutes** → reject and delete temporary secret/credential;
-- **auto-unlock configured while auto-mount is disabled** → reject/remove the stale protected material;
-- **DPAPI blob unavailable/corrupt** → automatic task cannot unlock the volume; durable visual-key recovery remains available;
-- **WinSpd runtime missing** → the Encrypted Volumes GUI reports runtime/host status; ordinary file/folder encryption remains usable;
-- **volume authentication/corruption failure** → do not expose unauthenticated blocks as a valid disk;
-- **drive letter occupied** → do not evict the existing Windows volume;
-- **mounted-state marker refers to a dead process** → GUI removes the stale marker after checking the PID.
+## Drive-letter assignment
 
-## Runtime dependency
+A preferred drive letter is stored with the registration entry.
 
-The Windows virtual-disk layer uses external WinSpd. OrIsyVra currently:
+After WinSpd attachment, the mount host compares Windows volume state before and after attachment to identify the new volume. It then:
 
-- dynamically probes the WinSpd runtime;
-- keeps it optional from file/folder encryption;
-- does not silently download/install it;
-- includes a GUI recheck/status path;
-- bundles the OrIsyVra mount host in the Windows installer.
+1. checks whether the preferred letter is free;
+2. assigns that letter to the new volume;
+3. verifies the assignment;
+4. removes any temporary Windows-assigned letter.
 
-A one-click guided WinSpd installation flow is still open work.
+An occupied preferred letter is left unchanged.
 
-## Validation status
+## Clean disconnection
 
-Current CI verifies on Windows x64:
+On **Safely disconnect**, the mount host:
 
-- `cargo test --workspace --all-features`;
-- `cargo build --release --workspace`;
-- presence of the file GUI, encrypted-volume GUI, CLI, analysis tool and mount host;
-- Inno Setup installer creation;
-- the normal release Defender/package validation path.
+1. requests Windows to dismount and remove the active drive-letter mount point;
+2. synchronizes the encrypted backing volume;
+3. shuts down the WinSpd storage unit;
+4. marks the authenticated volume clean;
+5. removes state and stop markers.
 
-This does **not** replace real-machine interoperability testing. Remaining hardening includes multiple Windows/WinSpd versions, occupied drive letters, sleep/resume, sign-out/shutdown, force-kill during writes, Windows Update/reboot, disk-full conditions, large sequential/random I/O and broad application compatibility.
+If clean disconnection does not complete, the volume remains dirty and is recovered from its authenticated committed state on the next open.
+
+## Failure handling
+
+| Condition | Result |
+|---|---|
+| PIN-card binding missing | unlock is rejected |
+| wrong PIN or passphrase | authentication fails |
+| temporary credential expired | credential and temporary secret are removed |
+| DPAPI blob missing or corrupt | automatic unlock fails |
+| WinSpd runtime unavailable | mount fails; file encryption remains available |
+| backing-volume authentication fails | virtual disk is not exposed |
+| preferred drive letter occupied | Windows assignment is retained |
+| duplicate mount request | per-entry mutex prevents a second host instance |
+| backing file already open for write | exclusive file open fails |
+
+## Security boundary
+
+Fully automatic mounting moves the unlock boundary to the current Windows user account. A process with sufficient access to that account may be able to invoke DPAPI or access data after the volume is mounted.
+
+Prompt-based mounting retains a user credential step at sign-in but still depends on the security of the active Windows session.
+
+See [`THREAT_MODEL.md`](THREAT_MODEL.md).
+
+## Validation
+
+The release workflow builds and tests the Windows GUI, mount host, CLI, analysis tool, and installer. Real-machine testing across WinSpd versions, sleep/resume, shutdown, disk-full conditions, large random I/O, and application compatibility remains ongoing.

@@ -1,0 +1,16 @@
+[package]
+name = "orisyvra-pin"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Windows device-bound 4-digit PIN visual-key support for OrIsyVra"
+publish = false
+
+[dependencies]
+orisyvra = { path = "../orisyvra" }
+orisyvra-windows = { path = "../orisyvra-windows" }
+rand.workspace = true
+zeroize.workspace = true

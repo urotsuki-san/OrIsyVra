@@ -2,6 +2,8 @@
 
 Status: `0.2.0-alpha.1`
 
+The construction name describes parameter sizes. Native Research Mode has no claimed concrete security level.
+
 ## Parameters
 
 | Parameter | Value |
@@ -17,15 +19,21 @@ Status: `0.2.0-alpha.1`
 
 ## Core permutation
 
-Each round performs constant injection, three scheduled collision updates, wave propagation, bidirectional cross-rail injection, word rotations, and rail-local word permutations. The exact normative operations and constants are defined in `crates/orisyvra-core/src/permutation.rs` and `constants.rs`.
+Each round performs constant injection, three scheduled collision updates, wave propagation, bidirectional cross-rail injection, word rotations, and rail-local word permutations. The normative operations and constants are defined in `crates/orisyvra-core/src/permutation.rs` and `constants.rs`.
+
+State, key, capacity, tag, and round-count sizes are not security claims. Concrete usage bounds and external cryptanalysis remain open work.
 
 ## Keyed primitive
 
-`prf_parts(K, domain, parts, output_length)` uses the P768 state as a keyed sponge. Each part is length-prefixed before absorption. Domain identifiers separate key derivation, header binding, Record-SIV, stream generation, and manifest authentication.
+`prf_parts(K, domain, parts, output_length)` uses the P768 state as a keyed sponge. Each part is length-prefixed before absorption. Domain identifiers separate key derivation, header binding, Record-SIV, stream generation, manifest authentication, and other internal purposes.
+
+## Master key
+
+Each Visual Key contains an operating-system-CSPRNG-generated 384-bit master key. Human credentials protect the key capsule; they do not determine the master key.
 
 ## Protected key capsule
 
-The internal key capsule contains one random 384-bit master key protected by Argon2id and XChaCha20-Poly1305.
+The key capsule protects the 384-bit master key with Argon2id and XChaCha20-Poly1305.
 
 | Offset | Size | Field |
 |---:|---:|---|
@@ -39,21 +47,32 @@ The internal key capsule contains one random 384-bit master key protected by Arg
 | 62 | 2 | wrapped-key length |
 | 64 | 64 | encrypted master key + tag |
 
-The GUI normally stores this capsule inside one visual-key PNG rather than exposing a separate key file.
+The desktop application normally stores this capsule inside the Visual Key PNG.
 
-## Visual-key PNG
+## Windows four-digit PIN cards
 
-A digital visual key is a valid PNG containing:
+Windows PIN cards use the same protected-capsule format with a device-bound Argon2id credential.
 
-1. a human-readable card design and key fingerprint;
-2. a private ancillary PNG chunk named `orKY` containing version, protected key capsule, and SHA-256 integrity digest;
-3. a QR representation of the same protected key capsule for print/camera recovery.
+1. Generate a random 256-bit device secret with the operating-system CSPRNG.
+2. Protect it for the current Windows user with DPAPI.
+3. Build the Argon2id credential from a fixed domain string, the device secret, and four ASCII decimal PIN digits.
+4. Store the DPAPI-protected device secret under the current user's OrIsyVra application data.
+5. Store the non-secret PIN-card policy marker in the PNG.
 
-The application reads the `orKY` chunk first. QR decoding is a fallback for scanned, photographed, or re-rendered cards whose private PNG chunk is no longer present.
+A copied PNG does not contain the DPAPI device secret. The scheme is bound to the Windows user/account trust boundary and does not provide hardware-backed non-exportability.
 
-The visual-key fingerprint is the first eight bytes of SHA-256 over the protected key capsule, displayed as hexadecimal groups. It is an identifier, not an authentication tag.
+## Visual Key PNG
 
-A printable PDF contains the QR fallback and fingerprint but cannot carry the digital PNG chunk.
+A current Visual Key PNG contains:
+
+1. the rendered card image and key fingerprint;
+2. a deterministic, non-secret Key Sigil for visual identification;
+3. private ancillary chunk `orKY` containing the protected key capsule and integrity metadata;
+4. for Windows PIN cards, private marker chunk `orPn` describing the unlock policy.
+
+The displayed key fingerprint is derived from SHA-256 over the protected key capsule. It is an identifier, not an authentication tag.
+
+Older passphrase-protected Visual Key formats remain accepted for compatibility.
 
 ## File header
 
@@ -97,12 +116,20 @@ Guarded Mode encrypts each complete Native body with XChaCha20-Poly1305. Guard k
 
 ## Manifest
 
-The final manifest authenticates total plaintext length, record count, and the SHA-384 transcript of the header plus all data records. Decryption persists the output file only after successful manifest verification.
+The final manifest authenticates total plaintext length, record count, and the SHA-384 transcript of the header plus all data records. Decrypted output is persisted only after successful manifest verification.
 
 ## Session unlock
 
-The desktop application derives and unwraps the master key once after the user supplies the visual-key passphrase. The unwrapped `MasterKey` remains only in process memory until the user presses Lock or the application exits. The passphrase itself is cleared after the unlock task finishes.
+The desktop application unwraps the selected master key once after credential verification. `MasterKey` remains in process memory until **Lock** or application exit. Human-entered PIN and passphrase buffers are cleared after use where practical.
 
-## Recovery visual key
+## Recovery keys
 
-A recovery visual key wraps the same master key under an independent recovery passphrase and stores the resulting protected capsule in a separate PNG or printable PDF.
+- A second PIN card can wrap the same master key under another Windows binding and PIN.
+- A passphrase recovery key can wrap the same master key independently of Windows DPAPI.
+- A copied PIN PNG does not replace the DPAPI binding required for device-bound unlock.
+
+## Security status
+
+Native Research Mode is experimental. The parameter name must not be interpreted as a claim of 384-bit, 256-bit, 192-bit, or another concrete security strength.
+
+Current validation includes known-answer tests, container-integrity tests, fuzzing infrastructure, and reduced-round exploratory analysis. Stronger trail modelling and independent cryptanalysis are still required before a concrete security claim can be made.

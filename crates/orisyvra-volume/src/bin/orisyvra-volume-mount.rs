@@ -10,13 +10,14 @@ compile_error!("orisyvra-volume-mount currently supports 64-bit Windows only");
 #[cfg(all(windows, target_pointer_width = "64"))]
 mod windows_app {
     use std::collections::{HashMap, HashSet};
-    use std::ffi::c_void;
+    use std::ffi::{c_void, OsStr};
     use std::io::Write as _;
     use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::process::CommandExt;
     use std::path::{Path, PathBuf};
-    use std::ptr;
     use std::process::Command;
-    use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+    use std::ptr;
+    use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex, OnceLock};
     use std::thread;
     use std::time::Duration;
@@ -30,6 +31,9 @@ mod windows_app {
     use zeroize::{Zeroize, Zeroizing};
 
     const ERROR_SUCCESS: u32 = 0;
+    const ERROR_ALREADY_EXISTS: u32 = 183;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    const SW_HIDE: i32 = 0;
     const SECTOR_SIZE: u32 = 4096;
     const DEFAULT_INTERNAL_BLOCK_SIZE: u32 = 64 * 1024;
     const MAX_TRANSFER_LENGTH: u32 = 64 * 1024;
@@ -112,27 +116,12 @@ mod windows_app {
         reserved: u32,
     }
 
-    type ReadCallback = unsafe extern "C" fn(
-        *mut c_void,
-        *mut c_void,
-        u64,
-        u32,
-        u8,
-        *mut StorageUnitStatus,
-    ) -> u8;
+    type ReadCallback =
+        unsafe extern "C" fn(*mut c_void, *mut c_void, u64, u32, u8, *mut StorageUnitStatus) -> u8;
     type WriteCallback = ReadCallback;
-    type FlushCallback = unsafe extern "C" fn(
-        *mut c_void,
-        u64,
-        u32,
-        *mut StorageUnitStatus,
-    ) -> u8;
-    type UnmapCallback = unsafe extern "C" fn(
-        *mut c_void,
-        *mut UnmapDescriptor,
-        u32,
-        *mut StorageUnitStatus,
-    ) -> u8;
+    type FlushCallback = unsafe extern "C" fn(*mut c_void, u64, u32, *mut StorageUnitStatus) -> u8;
+    type UnmapCallback =
+        unsafe extern "C" fn(*mut c_void, *mut UnmapDescriptor, u32, *mut StorageUnitStatus) -> u8;
 
     #[repr(C)]
     struct StorageUnitInterface {
@@ -142,6 +131,10 @@ mod windows_app {
         unmap: Option<UnmapCallback>,
         reserved: [usize; 12],
     }
+
+    const _: [(); 128] = [(); std::mem::size_of::<StorageUnitParams>()];
+    const _: [(); 32] = [(); std::mem::size_of::<StorageUnitStatus>()];
+    const _: [(); 128] = [(); std::mem::size_of::<StorageUnitInterface>()];
 
     static INTERFACE: StorageUnitInterface = StorageUnitInterface {
         read: Some(read_callback),
@@ -183,6 +176,19 @@ mod windows_app {
             chars_read: *mut u32,
             input_control: *mut c_void,
         ) -> i32;
+        fn CreateMutexW(
+            attributes: *mut c_void,
+            initial_owner: i32,
+            name: *const u16,
+        ) -> *mut c_void;
+        fn CloseHandle(handle: *mut c_void) -> i32;
+        fn GetConsoleWindow() -> *mut c_void;
+        fn GetLogicalDrives() -> u32;
+    }
+
+    #[link(name = "user32")]
+    extern "system" {
+        fn ShowWindow(window: *mut c_void, command: i32) -> i32;
     }
 
     struct WinSpdApi {
@@ -278,6 +284,62 @@ mod windows_app {
         Ok(std::mem::transmute_copy(&address))
     }
 
+    fn quiet_command(program: impl AsRef<OsStr>) -> Command {
+        let mut command = Command::new(program);
+        command.creation_flags(CREATE_NO_WINDOW);
+        command
+    }
+
+    fn hide_background_console() {
+        let background = std::env::args_os()
+            .nth(1)
+            .and_then(|value| value.into_string().ok())
+            .is_some_and(|value| {
+                matches!(
+                    value.to_ascii_lowercase().as_str(),
+                    "probe" | "run-entry" | "register-entry" | "unregister-entry"
+                )
+            });
+        if background {
+            let window = unsafe { GetConsoleWindow() };
+            if !window.is_null() {
+                let _ = unsafe { ShowWindow(window, SW_HIDE) };
+            }
+        }
+    }
+
+    struct EntryMutex(*mut c_void);
+
+    impl EntryMutex {
+        fn acquire(id: &str) -> Result<Option<Self>, String> {
+            let name = format!(r"Local\OrIsyVra-Volume-{id}");
+            let wide = OsStr::new(&name)
+                .encode_wide()
+                .chain(Some(0))
+                .collect::<Vec<_>>();
+            let handle = unsafe { CreateMutexW(ptr::null_mut(), 0, wide.as_ptr()) };
+            if handle.is_null() {
+                return Err(format!(
+                    "could not create mount mutex (Windows error {})",
+                    unsafe { GetLastError() }
+                ));
+            }
+            if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+                let _ = unsafe { CloseHandle(handle) };
+                return Ok(None);
+            }
+            Ok(Some(Self(handle)))
+        }
+    }
+
+    impl Drop for EntryMutex {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                let _ = unsafe { CloseHandle(self.0) };
+            }
+        }
+    }
+
     struct MountContext {
         volume: Volume,
         read_only: bool,
@@ -291,6 +353,8 @@ mod windows_app {
 
     static ACTIVE_STORAGE_UNIT: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
     static SHUTDOWN_FUNCTION: AtomicUsize = AtomicUsize::new(0);
+    static SAFE_SHUTDOWN: AtomicBool = AtomicBool::new(false);
+    static ACTIVE_DRIVE_LETTER: AtomicU8 = AtomicU8::new(0);
 
     unsafe extern "system" fn console_ctrl_handler(_control_type: u32) -> i32 {
         request_shutdown();
@@ -407,7 +471,12 @@ mod windows_app {
             return 1;
         }
         if buffer.is_null() {
-            set_error(status, SENSE_MEDIUM_ERROR, ASC_WRITE_ERROR, Some(block_address));
+            set_error(
+                status,
+                SENSE_MEDIUM_ERROR,
+                ASC_WRITE_ERROR,
+                Some(block_address),
+            );
             return 1;
         }
 
@@ -427,7 +496,12 @@ mod windows_app {
             });
         match result {
             Ok(()) => set_good(status),
-            Err(_) => set_error(status, SENSE_MEDIUM_ERROR, ASC_WRITE_ERROR, Some(block_address)),
+            Err(_) => set_error(
+                status,
+                SENSE_MEDIUM_ERROR,
+                ASC_WRITE_ERROR,
+                Some(block_address),
+            ),
         }
         1
     }
@@ -524,9 +598,13 @@ mod windows_app {
         if end > info.logical_capacity {
             return Err(VolumeError::BlockOutOfRange);
         }
+        if input.is_empty() {
+            return Ok(());
+        }
 
         let block_size = info.block_size as u64;
         let mut done = 0usize;
+        let mut updates = Vec::new();
         while done < input.len() {
             let absolute = offset + done as u64;
             let block_index = absolute / block_size;
@@ -539,11 +617,11 @@ mod windows_app {
                 .read_block(block_index)?
                 .unwrap_or_else(|| vec![0; logical_block_len]);
             block.resize(logical_block_len, 0);
-            block[block_offset..block_offset + take]
-                .copy_from_slice(&input[done..done + take]);
-            volume.write_block(block_index, &block)?;
+            block[block_offset..block_offset + take].copy_from_slice(&input[done..done + take]);
+            updates.push((block_index, block));
             done += take;
         }
+        volume.write_blocks(&updates)?;
         Ok(())
     }
 
@@ -562,12 +640,13 @@ mod windows_app {
         read_bytes(volume, 0, &mut existing).map_err(volume_error)?;
         if existing.iter().any(|byte| *byte != 0) {
             return Err(
-                "sector 0 is not empty; refusing to overwrite an existing partition table".to_owned(),
+                "sector 0 is not empty; refusing to overwrite an existing partition table"
+                    .to_owned(),
             );
         }
 
         let block_count = info.logical_capacity / SECTOR_SIZE as u64;
-        let start_lba = 1u64;
+        let start_lba = (1024 * 1024 / SECTOR_SIZE) as u64;
         let partition_count = block_count
             .checked_sub(start_lba)
             .ok_or_else(|| "volume has no space for a partition".to_owned())?;
@@ -623,7 +702,9 @@ mod windows_app {
 
     fn prompt_passphrase() -> Result<Zeroizing<String>, String> {
         print!("Visual-key passphrase: ");
-        std::io::stdout().flush().map_err(|error| error.to_string())?;
+        std::io::stdout()
+            .flush()
+            .map_err(|error| error.to_string())?;
 
         let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
         if handle.is_null() || handle as isize == -1 {
@@ -694,7 +775,8 @@ mod windows_app {
         if !secret.is_file() {
             return Ok(None);
         }
-        let mut mount_password = read_protected_secret(&secret).map_err(|error| error.to_string())?;
+        let mut mount_password =
+            read_protected_secret(&secret).map_err(|error| error.to_string())?;
         if !entry.auto_unlock {
             let _ = std::fs::remove_file(&secret);
         }
@@ -705,11 +787,23 @@ mod windows_app {
         master.map(Some)
     }
 
+    fn powershell_literal(value: &str) -> String {
+        format!("'{}'", value.replace('\'', "''"))
+    }
+
     fn register_entry(id: &str) -> Result<(), String> {
         let _entry = load_entry(id).map_err(|error| error.to_string())?;
         let executable = std::env::current_exe().map_err(|error| error.to_string())?;
-        let action = format!("\"{}\" run-entry {}", executable.display(), id);
-        let status = Command::new("schtasks.exe")
+        let command = format!(
+            "& {} run-entry {}",
+            powershell_literal(&executable.display().to_string()),
+            powershell_literal(id)
+        );
+        let action = format!(
+            "powershell.exe -NoProfile -NonInteractive -WindowStyle Hidden -Command \"{}\"",
+            command
+        );
+        let status = quiet_command("schtasks.exe")
             .args([
                 "/Create",
                 "/TN",
@@ -736,7 +830,7 @@ mod windows_app {
     }
 
     fn unregister_entry(id: &str) -> Result<(), String> {
-        let status = Command::new("schtasks.exe")
+        let status = quiet_command("schtasks.exe")
             .args(["/Delete", "/TN", &scheduled_task_name(id), "/F"])
             .status()
             .map_err(|error| format!("could not launch schtasks.exe: {error}"))?;
@@ -751,52 +845,183 @@ mod windows_app {
 
     #[derive(Default)]
     struct VolumeMountSnapshot {
-        guids: HashSet<String>,
+        mounts: HashMap<String, HashSet<char>>,
     }
 
     fn mountvol_snapshot() -> VolumeMountSnapshot {
-        let Ok(output) = Command::new("mountvol.exe").output() else {
+        let Ok(output) = quiet_command("mountvol.exe").output() else {
             return VolumeMountSnapshot::default();
         };
         let text = String::from_utf8_lossy(&output.stdout);
-        let guids = text
-            .lines()
-            .map(str::trim)
-            .filter(|line| line.starts_with(r"\\?\Volume{") && line.ends_with('\\'))
-            .map(ToOwned::to_owned)
-            .collect();
-        VolumeMountSnapshot { guids }
-    }
-
-    fn move_new_volume_to_preferred_letter(before: VolumeMountSnapshot, letter: char) {
-        let preferred = letter.to_ascii_uppercase();
-        let drive_root = format!("{preferred}:\\");
-        if Path::new(&drive_root).exists() {
-            eprintln!("Preferred drive letter {preferred}: is already in use; Windows assignment is kept.");
-            return;
-        }
-        for _ in 0..40 {
-            thread::sleep(Duration::from_millis(500));
-            let after = mountvol_snapshot();
-            let mut new_guids = after
-                .guids
-                .difference(&before.guids)
-                .cloned()
-                .collect::<Vec<_>>();
-            new_guids.sort();
-            if new_guids.len() == 1 {
-                let status = Command::new("mountvol.exe")
-                    .arg(format!("{preferred}:"))
-                    .arg(&new_guids[0])
-                    .status();
-                if status.is_ok_and(|value| value.success()) {
-                    println!("Preferred drive letter assigned: {preferred}:");
-                } else {
-                    eprintln!("Windows did not accept preferred drive letter {preferred}:; its automatic assignment is kept.");
-                }
-                return;
+        let mut snapshot = VolumeMountSnapshot::default();
+        let mut current_guid: Option<String> = None;
+        for line in text.lines() {
+            let value = line.trim();
+            if value.starts_with(r"\\?\Volume{") && value.ends_with('\\') {
+                current_guid = Some(value.to_owned());
+                snapshot.mounts.entry(value.to_owned()).or_default();
+                continue;
+            }
+            let Some(guid) = current_guid.as_ref() else {
+                continue;
+            };
+            let bytes = value.as_bytes();
+            if bytes.len() >= 3
+                && bytes[0].is_ascii_alphabetic()
+                && bytes[1] == b':'
+                && bytes[2] == b'\\'
+            {
+                snapshot
+                    .mounts
+                    .entry(guid.clone())
+                    .or_default()
+                    .insert((bytes[0] as char).to_ascii_uppercase());
             }
         }
+        snapshot
+    }
+
+    fn drive_letter_in_use(letter: char) -> bool {
+        let upper = letter.to_ascii_uppercase();
+        if !upper.is_ascii_alphabetic() {
+            return true;
+        }
+        let index = upper as u32 - 'A' as u32;
+        (unsafe { GetLogicalDrives() } & (1_u32 << index)) != 0
+    }
+
+    fn changed_volume(
+        before: &VolumeMountSnapshot,
+        after: &VolumeMountSnapshot,
+    ) -> Option<(String, HashSet<char>)> {
+        let mut candidates = after
+            .mounts
+            .iter()
+            .filter_map(|(guid, letters)| {
+                let previous = before.mounts.get(guid);
+                if previous != Some(letters) {
+                    Some((guid.clone(), letters.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by(|left, right| left.0.cmp(&right.0));
+        if candidates.len() == 1 {
+            candidates.pop()
+        } else {
+            None
+        }
+    }
+
+    fn move_new_volume_to_preferred_letter(
+        before: &VolumeMountSnapshot,
+        preferred_letter: Option<char>,
+    ) -> Option<char> {
+        for _ in 0..120 {
+            thread::sleep(Duration::from_millis(250));
+            let after = mountvol_snapshot();
+            let Some((guid, initial_letters)) = changed_volume(before, &after) else {
+                continue;
+            };
+            let fallback = initial_letters.iter().copied().min();
+            if let Some(letter) = fallback {
+                ACTIVE_DRIVE_LETTER.store(letter as u8, Ordering::Release);
+            }
+
+            let Some(preferred) = preferred_letter.map(|value| value.to_ascii_uppercase()) else {
+                return fallback;
+            };
+            if initial_letters.contains(&preferred) {
+                ACTIVE_DRIVE_LETTER.store(preferred as u8, Ordering::Release);
+                return Some(preferred);
+            }
+            if drive_letter_in_use(preferred) {
+                eprintln!(
+                    "Preferred drive letter {preferred}: is already in use; keeping Windows' assigned letter."
+                );
+                return fallback;
+            }
+
+            let assigned = quiet_command("mountvol.exe")
+                .arg(format!("{preferred}:"))
+                .arg(&guid)
+                .status()
+                .is_ok_and(|status| status.success());
+            if !assigned {
+                eprintln!("Windows rejected preferred drive letter {preferred}:");
+                return fallback;
+            }
+
+            for _ in 0..20 {
+                thread::sleep(Duration::from_millis(200));
+                let current = mountvol_snapshot();
+                let Some(letters) = current.mounts.get(&guid) else {
+                    continue;
+                };
+                if !letters.contains(&preferred) {
+                    continue;
+                }
+                let old_letters = letters
+                    .iter()
+                    .copied()
+                    .filter(|value| *value != preferred)
+                    .collect::<Vec<_>>();
+                for old in old_letters {
+                    let _ = quiet_command("mountvol.exe")
+                        .arg(format!("{old}:"))
+                        .arg("/D")
+                        .status();
+                }
+                ACTIVE_DRIVE_LETTER.store(preferred as u8, Ordering::Release);
+                return Some(preferred);
+            }
+            eprintln!("Preferred drive letter {preferred}: could not be verified.");
+            return fallback;
+        }
+        eprintln!("Windows did not expose the new volume before the drive-letter timeout.");
+        None
+    }
+
+    fn safely_dismount_active(preferred_letter: Option<char>) -> Result<(), String> {
+        let active = ACTIVE_DRIVE_LETTER.load(Ordering::Acquire);
+        let letter = if active != 0 {
+            active as char
+        } else {
+            preferred_letter
+                .map(|value| value.to_ascii_uppercase())
+                .ok_or_else(|| {
+                    "Windows drive letter is not available for safe dismount".to_owned()
+                })?
+        };
+        let mut detail = String::new();
+        for _ in 0..10 {
+            match quiet_command("mountvol.exe")
+                .arg(format!("{letter}:"))
+                .arg("/P")
+                .output()
+            {
+                Ok(output) if output.status.success() => return Ok(()),
+                Ok(output) => detail = String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+                Err(error) => detail = error.to_string(),
+            }
+            thread::sleep(Duration::from_millis(500));
+        }
+        Err(if detail.is_empty() {
+            format!("Windows refused to safely dismount {letter}:")
+        } else {
+            detail
+        })
+    }
+
+    fn sync_active_volume() -> Result<(), String> {
+        let storage_unit = ACTIVE_STORAGE_UNIT.load(Ordering::Acquire);
+        let context =
+            context_for(storage_unit).ok_or_else(|| "mount context is unavailable".to_owned())?;
+        let mut context = context
+            .lock()
+            .map_err(|_| "mount context lock poisoned".to_owned())?;
+        context.volume.sync().map_err(volume_error)
     }
 
     struct MountFiles {
@@ -822,7 +1047,6 @@ mod windows_app {
         if sector_count == 0 {
             return Err("volume has no addressable sectors".to_owned());
         }
-        volume.mark_dirty().map_err(volume_error)?;
 
         if let Some(state) = &files.state {
             if let Some(parent) = state.parent() {
@@ -848,19 +1072,17 @@ mod windows_app {
         let before = mountvol_snapshot();
         let params = StorageUnitParams::new(info.volume_id, sector_count, read_only);
         let mut storage_unit = ptr::null_mut();
-        let create_error = unsafe {
-            (api.create)(
-                ptr::null_mut(),
-                &params,
-                &INTERFACE,
-                &mut storage_unit,
-            )
-        };
+        let create_error =
+            unsafe { (api.create)(ptr::null_mut(), &params, &INTERFACE, &mut storage_unit) };
         if create_error != ERROR_SUCCESS || storage_unit.is_null() {
             return Err(format!(
                 "SpdStorageUnitCreate failed with error {create_error}. Windows mount tasks must run elevated."
             ));
         }
+
+        volume.mark_dirty().map_err(volume_error)?;
+        SAFE_SHUTDOWN.store(false, Ordering::Release);
+        ACTIVE_DRIVE_LETTER.store(0, Ordering::Release);
 
         let context = Arc::new(Mutex::new(MountContext { volume, read_only }));
         contexts()
@@ -874,7 +1096,7 @@ mod windows_app {
             SetConsoleCtrlHandler(Some(console_ctrl_handler), 1);
         }
 
-        let start_error = unsafe { (api.start_dispatcher)(storage_unit, 0) };
+        let start_error = unsafe { (api.start_dispatcher)(storage_unit, 1) };
         if start_error != ERROR_SUCCESS {
             contexts()
                 .lock()
@@ -882,6 +1104,9 @@ mod windows_app {
                 .and_then(|mut map| map.remove(&(storage_unit as usize)));
             ACTIVE_STORAGE_UNIT.store(ptr::null_mut(), Ordering::Release);
             SHUTDOWN_FUNCTION.store(0, Ordering::Release);
+            if let Ok(mut context) = context.lock() {
+                let _ = context.volume.mark_clean();
+            }
             unsafe {
                 SetConsoleCtrlHandler(Some(console_ctrl_handler), 0);
                 (api.delete)(storage_unit);
@@ -891,24 +1116,39 @@ mod windows_app {
             ));
         }
 
+        let actual_letter = move_new_volume_to_preferred_letter(&before, files.preferred_letter);
         if let Some(state) = &files.state {
-            std::fs::write(state, format!("pid={}\nvolume={}\n", std::process::id(), volume_path.display()))
-                .map_err(|error| error.to_string())?;
+            let letter_line = actual_letter
+                .map(|letter| format!("letter={letter}\n"))
+                .unwrap_or_default();
+            std::fs::write(
+                state,
+                format!("volume={}\n{letter_line}", volume_path.display()),
+            )
+            .map_err(|error| error.to_string())?;
         }
 
-        if let Some(letter) = files.preferred_letter {
-            thread::spawn(move || move_new_volume_to_preferred_letter(before, letter));
-        }
-
+        let preferred_letter = files.preferred_letter;
         if let Some(stop) = files.stop.clone() {
             thread::spawn(move || loop {
                 thread::sleep(Duration::from_millis(350));
                 if stop.exists() {
-                    let _ = std::fs::remove_file(&stop);
-                    unsafe {
-                        request_shutdown();
+                    match safely_dismount_active(preferred_letter)
+                        .and_then(|()| sync_active_volume())
+                    {
+                        Ok(()) => {
+                            let _ = std::fs::remove_file(&stop);
+                            SAFE_SHUTDOWN.store(true, Ordering::Release);
+                            unsafe {
+                                request_shutdown();
+                            }
+                            break;
+                        }
+                        Err(error) => {
+                            eprintln!("Safe disconnect is waiting: {error}");
+                            thread::sleep(Duration::from_secs(1));
+                        }
                     }
-                    break;
                 }
                 if ACTIVE_STORAGE_UNIT.load(Ordering::Acquire).is_null() {
                     break;
@@ -923,6 +1163,7 @@ mod windows_app {
 
         ACTIVE_STORAGE_UNIT.store(ptr::null_mut(), Ordering::Release);
         SHUTDOWN_FUNCTION.store(0, Ordering::Release);
+        ACTIVE_DRIVE_LETTER.store(0, Ordering::Release);
         unsafe {
             SetConsoleCtrlHandler(Some(console_ctrl_handler), 0);
         }
@@ -932,7 +1173,9 @@ mod windows_app {
             .and_then(|mut map| map.remove(&(storage_unit as usize)));
         if let Ok(mut context) = context.lock() {
             let _ = context.volume.sync();
-            let _ = context.volume.mark_clean();
+            if SAFE_SHUTDOWN.load(Ordering::Acquire) {
+                let _ = context.volume.mark_clean();
+            }
         }
         unsafe {
             (api.delete)(storage_unit);
@@ -943,15 +1186,18 @@ mod windows_app {
         if let Some(stop) = files.stop {
             let _ = std::fs::remove_file(stop);
         }
-        println!("Encrypted virtual disk detached cleanly.");
+        println!("Encrypted virtual disk detached.");
         Ok(())
     }
 
     fn run_entry(id: &str) -> Result<(), String> {
+        let Some(_entry_mutex) = EntryMutex::acquire(id)? else {
+            return Ok(());
+        };
         let entry = load_entry(id).map_err(|error| error.to_string())?;
         let state = state_path(id).map_err(|error| error.to_string())?;
         if state.is_file() {
-            return Ok(());
+            let _ = std::fs::remove_file(&state);
         }
         let Some(master) = unlock_entry_master(&entry)? else {
             return Ok(());
@@ -982,9 +1228,15 @@ mod windows_app {
             read_only: bool,
             initialize_mbr: bool,
         },
-        RunEntry { id: String },
-        RegisterEntry { id: String },
-        UnregisterEntry { id: String },
+        RunEntry {
+            id: String,
+        },
+        RegisterEntry {
+            id: String,
+        },
+        UnregisterEntry {
+            id: String,
+        },
     }
 
     fn parse_args() -> Result<ParsedCommand, String> {
@@ -1055,7 +1307,8 @@ mod windows_app {
 
         let key = key.ok_or_else(|| format!("--key is required\n\n{}", usage()))?;
         if command == "create" {
-            let size_gib = size_gib.ok_or_else(|| format!("--size-gib is required\n\n{}", usage()))?;
+            let size_gib =
+                size_gib.ok_or_else(|| format!("--size-gib is required\n\n{}", usage()))?;
             return Ok(ParsedCommand::Create {
                 volume,
                 key,
@@ -1092,7 +1345,8 @@ mod windows_app {
         internal_block_size: u32,
     ) -> Result<(), String> {
         let password = prompt_passphrase()?;
-        let master = unlock_key_source(key_path, password.as_bytes()).map_err(|error| error.to_string())?;
+        let master =
+            unlock_key_source(key_path, password.as_bytes()).map_err(|error| error.to_string())?;
         let capacity = size_gib
             .checked_mul(1024 * 1024 * 1024)
             .ok_or_else(|| "requested capacity is too large".to_owned())?;
@@ -1123,7 +1377,8 @@ mod windows_app {
         initialize_partition: bool,
     ) -> Result<(), String> {
         let password = prompt_passphrase()?;
-        let master = unlock_key_source(key_path, password.as_bytes()).map_err(|error| error.to_string())?;
+        let master =
+            unlock_key_source(key_path, password.as_bytes()).map_err(|error| error.to_string())?;
         if initialize_partition {
             let mut volume = Volume::open(volume_path, &master).map_err(volume_error)?;
             initialize_mbr(&mut volume)?;
@@ -1143,6 +1398,7 @@ mod windows_app {
     }
 
     pub fn run() -> Result<(), String> {
+        hide_background_console();
         match parse_args()? {
             ParsedCommand::Probe => {
                 let api = WinSpdApi::load()?;

@@ -19,7 +19,8 @@ use crate::keyfile::{
 const CARD_PREFIX: &str = "ORISYVRA-CARD1:";
 const CARD_WIDTH: u32 = 1200;
 const CARD_HEIGHT: u32 = 720;
-const CARD_PADDING: u32 = 56;
+const LEFT_TEXT_X: u32 = 68;
+const LEFT_TEXT_RIGHT: u32 = 562;
 const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
 const KEY_CHUNK_TYPE: &[u8; 4] = b"orKY";
 const KEY_CHUNK_MAGIC: &[u8; 8] = b"OYVPKY1\0";
@@ -54,17 +55,65 @@ fn validate_output(path: &Path, overwrite: bool) -> Result<()> {
     Ok(())
 }
 
-fn card_payload(keyfile: &[u8]) -> Result<(QrCode, KeyCardInfo)> {
-    validate_keyfile_bytes(keyfile)?;
-    let payload = format!("{CARD_PREFIX}{}", URL_SAFE_NO_PAD.encode(keyfile));
-    let code = QrCode::with_error_correction_level(payload.as_bytes(), EcLevel::Q)
-        .map_err(|error| Error::Image(error.to_string()))?;
-    Ok((
-        code,
-        KeyCardInfo {
-            card_id: card_id(keyfile),
-        },
-    ))
+fn text_width(text: &str, scale: u32) -> u32 {
+    let count = text.chars().count() as u32;
+    if count == 0 {
+        0
+    } else {
+        count
+            .saturating_mul(9_u32.saturating_mul(scale))
+            .saturating_sub(scale)
+    }
+}
+
+fn fitted_scale(text: &str, max_width: u32, preferred_scale: u32) -> u32 {
+    let mut scale = preferred_scale.max(1);
+    while scale > 1 && text_width(text, scale) > max_width {
+        scale -= 1;
+    }
+    scale
+}
+
+fn wrap_text(text: &str, max_width: u32, scale: u32) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut current = String::new();
+
+    for word in text.split_whitespace() {
+        let candidate = if current.is_empty() {
+            word.to_owned()
+        } else {
+            format!("{current} {word}")
+        };
+        if text_width(&candidate, scale) <= max_width {
+            current = candidate;
+            continue;
+        }
+
+        if !current.is_empty() {
+            lines.push(std::mem::take(&mut current));
+        }
+
+        if text_width(word, scale) <= max_width {
+            current.push_str(word);
+            continue;
+        }
+
+        let mut fragment = String::new();
+        for character in word.chars() {
+            let mut candidate = fragment.clone();
+            candidate.push(character);
+            if !fragment.is_empty() && text_width(&candidate, scale) > max_width {
+                lines.push(std::mem::take(&mut fragment));
+            }
+            fragment.push(character);
+        }
+        current = fragment;
+    }
+
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
 }
 
 fn draw_text(image: &mut RgbImage, text: &str, x: u32, y: u32, scale: u32, color: Rgb<u8>) {
@@ -92,9 +141,72 @@ fn draw_text(image: &mut RgbImage, text: &str, x: u32, y: u32, scale: u32, color
     }
 }
 
+fn draw_wrapped_text(
+    image: &mut RgbImage,
+    text: &str,
+    x: u32,
+    y: u32,
+    max_width: u32,
+    scale: u32,
+    color: Rgb<u8>,
+) {
+    const LINE_SPACING: u32 = 10;
+    let line_advance = 8_u32
+        .saturating_mul(scale)
+        .saturating_add(LINE_SPACING);
+    for (index, line) in wrap_text(text, max_width, scale).iter().enumerate() {
+        draw_text(
+            image,
+            line,
+            x,
+            y.saturating_add(index as u32 * line_advance),
+            scale,
+            color,
+        );
+    }
+}
+
+fn draw_centered_text(
+    image: &mut RgbImage,
+    text: &str,
+    center_x: u32,
+    y: u32,
+    scale: u32,
+    color: Rgb<u8>,
+) {
+    let width = text_width(text, scale);
+    let x = center_x.saturating_sub(width / 2);
+    draw_text(image, text, x, y, scale, color);
+}
+
+fn draw_centered_wrapped_text(
+    image: &mut RgbImage,
+    text: &str,
+    center_x: u32,
+    y: u32,
+    max_width: u32,
+    scale: u32,
+    color: Rgb<u8>,
+) {
+    const LINE_SPACING: u32 = 10;
+    let line_advance = 8_u32
+        .saturating_mul(scale)
+        .saturating_add(LINE_SPACING);
+    for (index, line) in wrap_text(text, max_width, scale).iter().enumerate() {
+        draw_centered_text(
+            image,
+            line,
+            center_x,
+            y.saturating_add(index as u32 * line_advance),
+            scale,
+            color,
+        );
+    }
+}
+
 fn fill_rect(image: &mut RgbImage, x: u32, y: u32, width: u32, height: u32, color: Rgb<u8>) {
-    let end_x = (x + width).min(image.width());
-    let end_y = (y + height).min(image.height());
+    let end_x = x.saturating_add(width).min(image.width());
+    let end_y = y.saturating_add(height).min(image.height());
     for py in y..end_y {
         for px in x..end_x {
             image.put_pixel(px, py, color);
@@ -102,100 +214,174 @@ fn fill_rect(image: &mut RgbImage, x: u32, y: u32, width: u32, height: u32, colo
     }
 }
 
-fn render_png_card(keyfile: &[u8]) -> Result<(RgbImage, KeyCardInfo)> {
-    let (code, info) = card_payload(keyfile)?;
-    let qr = code
-        .render::<Luma<u8>>()
-        .quiet_zone(true)
-        .module_dimensions(4, 4)
-        .build();
+fn draw_key_sigil(card: &mut RgbImage, keyfile: &[u8]) {
+    let digest = Sha256::digest(keyfile);
+    let panel_x = 665_u32;
+    let panel_y = 92_u32;
+    let panel_w = 465_u32;
+    let panel_h = 530_u32;
+    let panel_center_x = panel_x + panel_w / 2;
+    fill_rect(card, panel_x, panel_y, panel_w, panel_h, Rgb([12, 28, 49]));
+    fill_rect(card, panel_x, panel_y, panel_w, 3, Rgb([74, 196, 235]));
+    fill_rect(card, panel_x, panel_y + panel_h - 3, panel_w, 3, Rgb([74, 196, 235]));
 
+    let primary = Rgb([
+        90_u8.saturating_add(digest[0] % 90),
+        120_u8.saturating_add(digest[1] % 90),
+        145_u8.saturating_add(digest[2] % 90),
+    ]);
+    let secondary = Rgb([
+        80_u8.saturating_add(digest[3] % 100),
+        90_u8.saturating_add(digest[4] % 110),
+        125_u8.saturating_add(digest[5] % 110),
+    ]);
+
+    let cell = 43_u32;
+    let grid_w = 7 * cell;
+    let grid_x = panel_x + (panel_w - grid_w) / 2;
+    let grid_y = panel_y + 84;
+    let rows = 7_usize;
+    let half_cols = 4_usize;
+    for row in 0..rows {
+        for col in 0..half_cols {
+            let index = row * half_cols + col;
+            let byte = digest[6 + index / 8];
+            let on = ((byte >> (index % 8)) & 1) == 1;
+            if !on {
+                continue;
+            }
+            let inset = 5 + (digest[(index + 13) % digest.len()] as u32 % 7);
+            let size = cell.saturating_sub(inset * 2);
+            let y = grid_y + row as u32 * cell + inset;
+            let left_x = grid_x + col as u32 * cell + inset;
+            let mirror_col = 6_usize.saturating_sub(col);
+            let right_x = grid_x + mirror_col as u32 * cell + inset;
+            let color = if (row + col) % 2 == 0 { primary } else { secondary };
+            fill_rect(card, left_x, y, size, size, color);
+            if right_x != left_x {
+                fill_rect(card, right_x, y, size, size, color);
+            }
+        }
+    }
+
+    let center_x = grid_x + 3 * cell + (cell - 26) / 2;
+    let center_y = grid_y + 3 * cell + (cell - 26) / 2;
+    fill_rect(card, center_x, center_y, 26, 26, Rgb([230, 245, 252]));
+    fill_rect(card, center_x + 6, center_y + 6, 14, 14, primary);
+
+    draw_centered_text(
+        card,
+        "KEY SIGIL",
+        panel_center_x,
+        panel_y + 28,
+        3,
+        Rgb([82, 213, 255]),
+    );
+    draw_centered_text(
+        card,
+        "VISUAL FINGERPRINT",
+        panel_center_x,
+        panel_y + 420,
+        2,
+        Rgb([145, 165, 195]),
+    );
+    let note_width = panel_w - 132;
+    draw_centered_wrapped_text(
+        card,
+        "NOT A SECRET - VERIFY BY SIGHT",
+        panel_center_x,
+        panel_y + 462,
+        note_width,
+        2,
+        Rgb([190, 205, 225]),
+    );
+}
+
+fn render_png_card(keyfile: &[u8]) -> Result<(RgbImage, KeyCardInfo)> {
+    validate_keyfile_bytes(keyfile)?;
+    let info = KeyCardInfo {
+        card_id: card_id(keyfile),
+    };
     let mut card = RgbImage::from_pixel(CARD_WIDTH, CARD_HEIGHT, Rgb([8, 18, 34]));
     fill_rect(&mut card, 0, 0, CARD_WIDTH, 10, Rgb([82, 213, 255]));
-    fill_rect(&mut card, 62, 205, 470, 2, Rgb([53, 76, 105]));
-    fill_rect(&mut card, 62, 550, 470, 2, Rgb([53, 76, 105]));
+    fill_rect(&mut card, 62, 205, 500, 2, Rgb([53, 76, 105]));
+    fill_rect(&mut card, 62, 550, 500, 2, Rgb([53, 76, 105]));
 
+    let left_width = LEFT_TEXT_RIGHT - LEFT_TEXT_X;
     draw_text(&mut card, "ORISYVRA", 64, 62, 6, Rgb([238, 247, 255]));
-    draw_text(&mut card, "VISUAL KEY", 68, 138, 3, Rgb([82, 213, 255]));
+    draw_text(&mut card, "VISUAL KEY", LEFT_TEXT_X, 138, 3, Rgb([82, 213, 255]));
     draw_text(
         &mut card,
-        "ENCRYPTION KEY",
-        68,
+        "DIGITAL KEY CARD",
+        LEFT_TEXT_X,
         242,
         2,
         Rgb([145, 165, 195]),
     );
-    draw_text(
+    draw_wrapped_text(
         &mut card,
-        "KEEP PRIVATE - REQUIRED FOR RECOVERY",
-        68,
+        "KEEP PRIVATE - COPYING THIS FILE COPIES THE KEY CARD",
+        LEFT_TEXT_X,
         288,
+        left_width,
         2,
         Rgb([190, 205, 225]),
     );
     draw_text(
         &mut card,
         "KEY FINGERPRINT",
-        68,
+        LEFT_TEXT_X,
         404,
         2,
         Rgb([145, 165, 195]),
     );
+    let fingerprint = grouped_card_id(&info.card_id);
+    let fingerprint_scale = fitted_scale(&fingerprint, left_width, 3);
     draw_text(
         &mut card,
-        &grouped_card_id(&info.card_id),
-        68,
+        &fingerprint,
+        LEFT_TEXT_X,
         450,
-        3,
+        fingerprint_scale,
         Rgb([238, 247, 255]),
     );
-    draw_text(
+    draw_wrapped_text(
         &mut card,
-        "OPEN THIS PNG DIRECTLY IN ORISYVRA",
-        68,
+        "OPEN THIS PNG IN ORISYVRA",
+        LEFT_TEXT_X,
         592,
+        left_width,
         2,
         Rgb([145, 165, 195]),
     );
-    draw_text(
+    draw_wrapped_text(
         &mut card,
-        "QR = PRINT / CAMERA RECOVERY ONLY",
-        68,
+        "KEY DATA IS EMBEDDED IN A PRIVATE PNG CHUNK",
+        LEFT_TEXT_X,
         626,
+        left_width,
         2,
         Rgb([145, 165, 195]),
     );
-
-    let qr_x = CARD_WIDTH
-        .checked_sub(qr.width() + CARD_PADDING)
-        .ok_or_else(|| Error::InvalidInput("key card QR image is too large".into()))?;
-    let qr_y = (CARD_HEIGHT - qr.height()) / 2;
-    fill_rect(
-        &mut card,
-        qr_x.saturating_sub(14),
-        qr_y.saturating_sub(14),
-        qr.width() + 28,
-        qr.height() + 28,
-        Rgb([245, 248, 252]),
-    );
-    for (x, y, pixel) in qr.enumerate_pixels() {
-        let value = pixel.0[0];
-        card.put_pixel(qr_x + x, qr_y + y, Rgb([value, value, value]));
-    }
-    draw_text(
-        &mut card,
-        "OPTICAL BACKUP",
-        qr_x,
-        (qr_y + qr.height() + 18).min(CARD_HEIGHT - 28),
-        2,
-        Rgb([145, 165, 195]),
-    );
-
+    draw_key_sigil(&mut card, keyfile);
     Ok((card, info))
 }
 
+fn legacy_card_payload(keyfile: &[u8]) -> Result<(QrCode, KeyCardInfo)> {
+    validate_keyfile_bytes(keyfile)?;
+    let payload = format!("{CARD_PREFIX}{}", URL_SAFE_NO_PAD.encode(keyfile));
+    let code = QrCode::with_error_correction_level(payload.as_bytes(), EcLevel::Q)
+        .map_err(|error| Error::Image(error.to_string()))?;
+    Ok((
+        code,
+        KeyCardInfo {
+            card_id: card_id(keyfile),
+        },
+    ))
+}
+
 fn render_pdf_card(keyfile: &[u8]) -> Result<(Vec<u8>, KeyCardInfo)> {
-    let (code, info) = card_payload(keyfile)?;
+    let (code, info) = legacy_card_payload(keyfile)?;
     let quiet = 4_usize;
     let modules = code.width() + quiet * 2;
     let scale = (360.0_f32 / modules as f32).floor().max(1.0);
@@ -209,7 +395,7 @@ fn render_pdf_card(keyfile: &[u8]) -> Result<(Vec<u8>, KeyCardInfo)> {
     writeln!(stream, "1 1 1 rg BT /F1 28 Tf 56 718 Td (ORISYVRA) Tj ET").expect("String write");
     writeln!(
         stream,
-        "0.32 0.84 1 rg BT /F1 15 Tf 56 688 Td (VISUAL KEY) Tj ET"
+        "0.32 0.84 1 rg BT /F1 15 Tf 56 688 Td (LEGACY OPTICAL RECOVERY) Tj ET"
     )
     .expect("String write");
     writeln!(
@@ -223,8 +409,8 @@ fn render_pdf_card(keyfile: &[u8]) -> Result<(Vec<u8>, KeyCardInfo)> {
         grouped_card_id(&info.card_id)
     )
     .expect("String write");
-    writeln!(stream, "0.75 0.82 0.9 rg BT /F1 10 Tf 56 530 Td (Keep private. Use OrIsyVra to unlock this key.) Tj ET").expect("String write");
-    writeln!(stream, "0.75 0.82 0.9 rg BT /F1 10 Tf 56 510 Td (QR is provided for optical recovery from print or camera.) Tj ET").expect("String write");
+    writeln!(stream, "0.75 0.82 0.9 rg BT /F1 10 Tf 56 530 Td (Optional optical recovery export.) Tj ET").expect("String write");
+    writeln!(stream, "0.75 0.82 0.9 rg BT /F1 10 Tf 56 510 Td (Normal PNG cards use an embedded private key chunk and Key Sigil.) Tj ET").expect("String write");
     writeln!(
         stream,
         "1 1 1 rg {:.2} {:.2} {:.2} {:.2} re f",
@@ -326,7 +512,6 @@ fn inject_key_chunk(png: &[u8], keyfile: &[u8]) -> Result<Vec<u8>> {
     let mut chunk_crc_input = Vec::with_capacity(4 + data.len());
     chunk_crc_input.extend_from_slice(KEY_CHUNK_TYPE);
     chunk_crc_input.extend_from_slice(&data);
-
     let mut output = Vec::with_capacity(png.len() + 12 + data.len());
     output.extend_from_slice(PNG_SIGNATURE);
     let mut cursor = PNG_SIGNATURE.len();
@@ -468,6 +653,7 @@ pub fn decode_keycard_image(image_bytes: &[u8]) -> Result<Vec<u8>> {
     if let Some(keyfile) = extract_key_chunk(image_bytes)? {
         return Ok(keyfile);
     }
+    // Backward compatibility for old QR-bearing visual keys and photographed cards.
     decode_qr_keycard(image_bytes)
 }
 
@@ -543,47 +729,47 @@ pub fn import_keycard(input: &Path, output_keyfile: &Path, overwrite: bool) -> R
 #[cfg(test)]
 mod tests {
     use super::{
-        create_keycard, export_keycard, import_keycard, key_source_info, unlock_key_source,
+        create_keycard, fitted_scale, key_source_info, text_width, unlock_key_source, wrap_text,
     };
-    use crate::{create_keyfile, unlock_keyfile, KeyfileParams};
+    use crate::KeyfileParams;
 
     #[test]
-    fn keycard_round_trip() {
+    fn new_png_card_round_trip_uses_embedded_key_chunk() {
         let directory = tempfile::tempdir().expect("temp directory");
-        let key = directory.path().join("source.orisyvra-key");
         let card = directory.path().join("card.png");
-        let restored = directory.path().join("restored.orisyvra-key");
         let password = b"correct horse battery staple";
         let params = KeyfileParams {
             memory_kib: 8 * 1024,
             iterations: 1,
             parallelism: 1,
         };
-        create_keyfile(&key, password, params, false).expect("create key");
-        let exported = export_keycard(&key, &card, false).expect("export card");
-        let imported = import_keycard(&card, &restored, false).expect("import card");
-        assert_eq!(exported, imported);
-        assert_eq!(
-            unlock_keyfile(&key, password).unwrap().as_bytes(),
-            unlock_keyfile(&restored, password).unwrap().as_bytes()
-        );
+        let created = create_keycard(&card, password, params, false).expect("create card");
+        let loaded = key_source_info(&card).expect("read card");
+        assert_eq!(created, loaded);
+        unlock_key_source(&card, password).expect("unlock card");
     }
 
     #[test]
-    fn visual_key_can_be_used_directly() {
-        let directory = tempfile::tempdir().expect("temp directory");
-        let card = directory.path().join("visual-key.png");
-        let password = b"correct horse battery staple";
-        let params = KeyfileParams {
-            memory_kib: 8 * 1024,
-            iterations: 1,
-            parallelism: 1,
-        };
-        let created = create_keycard(&card, password, params, false).expect("create visual key");
-        let info = key_source_info(&card).expect("read visual key info");
-        assert_eq!(created, info);
-        let first = unlock_key_source(&card, password).expect("unlock visual key");
-        let second = unlock_key_source(&card, password).expect("unlock visual key again");
-        assert_eq!(first.as_bytes(), second.as_bytes());
+    fn fingerprint_scale_is_reduced_when_needed() {
+        let fingerprint = "3B5A-D975-F4D4-10E3";
+        let scale = fitted_scale(fingerprint, 494, 3);
+        assert_eq!(scale, 2);
+        assert!(text_width(fingerprint, scale) <= 494);
+    }
+
+    #[test]
+    fn card_copy_wraps_stay_inside_their_columns() {
+        for (text, max_width) in [
+            ("KEEP PRIVATE - COPYING THIS FILE COPIES THE KEY CARD", 494_u32),
+            ("OPEN THIS PNG IN ORISYVRA", 494_u32),
+            ("KEY DATA IS EMBEDDED IN A PRIVATE PNG CHUNK", 494_u32),
+            ("NOT A SECRET - VERIFY BY SIGHT", 333_u32),
+        ] {
+            let lines = wrap_text(text, max_width, 2);
+            assert!(!lines.is_empty());
+            assert!(lines
+                .iter()
+                .all(|line| text_width(line, 2) <= max_width));
+        }
     }
 }

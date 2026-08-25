@@ -2,6 +2,7 @@
 members = [
     "crates/orisyvra-core",
     "crates/orisyvra",
+    "crates/orisyvra-pin",
     "crates/orisyvra-analysis",
     "crates/orisyvra-gui",
     "crates/orisyvra-volume",

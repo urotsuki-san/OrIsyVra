@@ -2,16 +2,18 @@
 
 ## Implemented
 
-- [x] P768/K384 collision–wave core
+- [x] P768/K384 collision-wave core
 - [x] fixed known-answer tests
 - [x] Guarded and Native streaming modes
 - [x] Argon2id-protected key capsules
-- [x] one-file visual-key PNG
-- [x] standards-compliant private PNG key chunk
-- [x] QR fallback for print/camera recovery
-- [x] separate-passphrase recovery visual keys
-- [x] session-only key unlock in the desktop application
-- [x] Guarded / Native selector in the desktop application
+- [x] one-file Visual Key PNG
+- [x] private PNG key chunk
+- [x] Key Sigil visual identifier
+- [x] passphrase recovery Visual Keys
+- [x] Windows device-bound four-digit PIN cards
+- [x] DPAPI-protected random PIN-card device secret
+- [x] session key unlock in the desktop application
+- [x] Guarded / Native selector
 - [x] file and folder batch processing
 - [x] Windows, Linux, and macOS GUI builds
 - [x] reduced-round analysis commands
@@ -37,56 +39,70 @@
 - [x] explicit flush semantics
 - [ ] bounded write cache
 - [ ] authenticated sparse deallocation / UNMAP records
-- [ ] randomized sector stress test harness
+- [ ] randomized sector stress harness
 
 ### P2C — Windows virtual disk
 
 - [x] WinSpd runtime integration
-- [x] expose `.orisyvra-volume` as a virtual SCSI disk
+- [x] `.orisyvra-volume` virtual SCSI disk
 - [x] read-only mount option
-- [x] attach/eject and authenticated crash-recovery lifecycle
+- [x] attach/eject lifecycle and crash recovery
 - [x] NTFS/exFAT first-use formatting flow
 - [x] preferred drive-letter assignment
-- [ ] broad Explorer / Office / browser / archive compatibility matrix on real machines
-- [ ] sleep/resume and Windows-update endurance matrix
+- [ ] Explorer / Office / browser / archive compatibility matrix on real machines
+- [ ] sleep/resume and Windows Update endurance tests
 
 ### P2D — GUI and Windows auto-mount
 
-- [x] dedicated create/open/mount/eject GUI
-- [x] custom logical-capacity selection
+- [x] create/connect/disconnect GUI
+- [x] pending connection resumes after key unlock
+- [x] automatic Windows mount-task registration
+- [x] custom logical capacity
 - [x] registered-volume list without plaintext secrets
-- [x] **Mount automatically when I sign in to Windows**
-- [x] prompt-once startup unlock grouped by visual key
-- [x] optional Windows-account-bound DPAPI auto-unlock
+- [x] connect at Windows sign-in
+- [x] prompt-once startup unlock grouped by Visual Key
+- [x] four-digit PIN support in the volume GUI
+- [x] optional DPAPI auto-unlock
 - [x] manual key lock
 - [x] WinSpd runtime detection
-- [x] Windows installer integration and Defender validation
+- [x] Windows installer and Defender validation path
 - [x] temporary manual-mount credential expiry
 - [ ] idle-time automatic lock
-- [ ] one-click guided WinSpd installation flow
+- [ ] guided WinSpd installation
 
 ### P2E — Other platforms
 
 - [ ] Linux mount/block strategy
-- [ ] macOS mount strategy after the Windows format and recovery behavior stabilize
+- [ ] macOS mount strategy after Windows behavior stabilizes
 
 See [`VOLUME.md`](VOLUME.md) and [`WINDOWS_AUTOMOUNT.md`](WINDOWS_AUTOMOUNT.md).
 
-## Branding / README
+## Key management UX
 
-- [x] Hestia-style OrIsyVra hero-art direction
-- [x] final OrIsyVra sister-character artwork with padlock hair ornament
-- [x] `docs/assets/readme/orisyvra-showcase-hero-v1.png`
-- [x] README hero integration
+- [x] four-digit PIN input on Windows
+- [x] PIN combined with a DPAPI-bound random device secret
+- [x] copied PIN PNG rejected when its Windows binding is unavailable
+- [x] Key Sigil visual identifier
+- [ ] guided device migration using an authorized recovery key
+- [ ] optional Windows Hello / TPM-backed enhancement
 
-See [`MASCOT.md`](MASCOT.md).
+## Documentation and branding
+
+- [x] README hero artwork
+- [x] OrIsyVra character identity and asset constraints
+- [x] construction parameters separated from security claims
+- [x] Windows PIN-card and encrypted-drive documentation
 
 ## Research and hardening
 
 - [ ] deterministic container vectors
-- [ ] long-running parser and visual-key fuzzing
+- [ ] long-running parser and Visual Key fuzzing
+- [ ] per-output-bit differential-bias analysis
 - [ ] SAT, SMT, and MILP trail models
+- [ ] rotational / invariant-subspace / integral analysis
 - [ ] concrete per-key usage bounds
 - [ ] external cryptanalysis
 - [ ] signed and reproducible installers
-- [ ] print, scan, crop, and damage tests for visual keys
+- [ ] broader Windows encrypted-drive endurance testing
+
+Native Research Mode has no claimed concrete security strength.
